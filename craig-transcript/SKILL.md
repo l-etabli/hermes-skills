@@ -42,6 +42,7 @@ Ignore les paramètres supplémentaires (`&delete=...`). Si plusieurs URLs sont 
 
 **Phase A — Capture (responsabilité directe de ce skill)** :
 - Pull le `.vtt` depuis l'API Craig (auth `?key=`)
+- **Note technique** : Utiliser un `User-Agent` de navigateur (ex: Mozilla/5.0...) pour toutes les requêtes afin d'éviter les erreurs 403 Forbidden.
 - Parse + reformate en Markdown lisible avec speakers
 - Dépose dans `$WIKI_PATH/raw/transcripts/<date>-<slug>.md` avec **frontmatter raw** (sha256, source_url, ingested)
 - Dédup via sha256 (skip toute la suite si déjà présent à l'identique)
