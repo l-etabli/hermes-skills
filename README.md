@@ -91,7 +91,7 @@ Géré par [hermes-infra](https://github.com/l-etabli/hermes-infra) :
 
 | Skill | Catégorie | Status | Description |
 |---|---|---|---|
-| [`craig-transcript`](./craig-transcript/) | voice | 🚧 draft | Récupère et formate la transcription d'un enregistrement Craig depuis une URL `craig.horse/rec/<id>?key=<key>` |
+| [`craig-transcript`](./craig-transcript/) | voice | 🚧 draft | Capture la transcription d'un enregistrement Craig (URL `craig.horse/rec/<id>?key=<key>`) dans `raw/transcripts/`, puis enchaîne `llm-wiki ingest` pour la promouvoir en pages wiki |
 
 ## Liens
 
