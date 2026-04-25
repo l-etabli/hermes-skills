@@ -240,7 +240,7 @@ def transcribe_groq(audio_path: pathlib.Path) -> dict:
 
 def parse_recorded_at(name: str, drive_created: str) -> str:
     m = re.search(
-        r"craig_[A-Za-z0-9]+_(\d{4})-(\d{1,2})-(\d{1,2})_(\d{1,2})-(\d{1,2})-(\d{1,2})",
+        r"craig_[A-Za-z0-9_-]+_(\d{4})-(\d{1,2})-(\d{1,2})_(\d{1,2})-(\d{1,2})-(\d{1,2})",
         name,
     )
     if m:
@@ -321,7 +321,7 @@ def main() -> int:
     args = ap.parse_args()
 
     craig_id = args.craig_id.strip()
-    if not re.fullmatch(r"[A-Za-z0-9]+", craig_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", craig_id):
         emit({"status": "error", "reason": "bad-craig-id", "detail": craig_id})
         return 2
 

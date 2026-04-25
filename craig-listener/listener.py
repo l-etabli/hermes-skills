@@ -77,7 +77,7 @@ SKILLS_ROOT = pathlib.Path(
 )
 SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
 
-RECORDING_ID_RE = re.compile(r"Recording\s+ID\s*:\s*([A-Za-z0-9]+)", re.IGNORECASE)
+RECORDING_ID_RE = re.compile(r"Recording\s+ID\s*:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
 
 # Markers that strongly suggest the message is a Craig recording panel

@@ -70,7 +70,7 @@ DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
 
 DISCORD_API = "https://discord.com/api/v10"
-RECORDING_ID_RE = re.compile(r"Recording\s+ID\s*:\s*([A-Za-z0-9]+)", re.IGNORECASE)
+RECORDING_ID_RE = re.compile(r"Recording\s+ID\s*:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
 STARTED_RE = re.compile(r"Started\s*:\s*([0-9:]+)", re.IGNORECASE)
 CHANNEL_NAME_RE = re.compile(
@@ -127,7 +127,10 @@ def transcribed_ids() -> dict[str, str]:
     out: dict[str, str] = {}
     if not TRANSCRIPTS_DIR.exists():
         return out
-    pat = re.compile(r"-craig-([A-Za-z0-9]+)-")
+    # Filename layout: <date>-craig-<id>-<slugified_date>.md, where <id>
+    # may contain `-` and `_`. Anchor on the trailing date+".md" so the
+    # capture stops cleanly at the boundary.
+    pat = re.compile(r"-craig-([A-Za-z0-9_-]+?)-\d{4}-\d{2}-\d{2}\.md$")
     for md in TRANSCRIPTS_DIR.glob("*.md"):
         m = pat.search(md.name)
         if m:

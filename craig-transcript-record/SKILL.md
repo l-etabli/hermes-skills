@@ -48,7 +48,7 @@ Active-toi **uniquement** quand un autre skill (`craig-listener` ou `craig-scan`
 
 - `craig-listener` te passe un ID extrait d'un événement Discord.
 - `craig-scan` te passe un ID issu de l'historique d'un `#craig-events`.
-- L'utilisateur mentionne une URL `craig.horse/rec/<id>` ou colle un message Craig en chat — extrais l'ID (regex `Recording ID:\s*([A-Za-z0-9]+)` ou `craig\.horse/rec/([A-Za-z0-9]+)`) et invoque-toi.
+- L'utilisateur mentionne une URL `craig.horse/rec/<id>` ou colle un message Craig en chat — extrais l'ID (regex `Recording ID:\s*([A-Za-z0-9_-]+)` ou `craig\.horse/rec/([A-Za-z0-9_-]+)` — Craig accepte `-` et `_` dans les IDs) et invoque-toi.
 
 **Ne pas utiliser** pour de l'audio non-Craig (mp3/m4a/wav direct, voice memos, exports Zoom). La V3 ne supporte que les zips Craig — un audio direct n'a pas de recording ID, donc rien à appeler. (Si ce besoin revient, on créera un skill séparé.)
 
