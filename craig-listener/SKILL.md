@@ -143,8 +143,19 @@ Le script :
 - **`skipped` / `already-transcribed`** → réagis ✅ pour confirmer qu'on est au courant.
 - **`error` / `no-recording-id`** → ce n'était pas un message Craig de recording. Retire la réaction ⏳, ignore silencieusement.
 - **`error` / `format-mismatch`** → ⚠️ **bruyant** : le message ressemble à un panel Craig (présence de `🔴 Recording`, `Voice Region:`, etc.) mais la regex `Recording ID:` a échoué. Très probablement le format Craig a changé. Notifie l'utilisateur avec le snippet, pour qu'on puisse mettre à jour la regex. Ne plus jamais ignorer silencieusement ce cas — sinon on arrête de transcrire sans s'en rendre compte.
-- **`error` / `missing-discord-ids` / `bad-discord-ids`** → tu as oublié de passer `--channel-id` ou `--message-id`. Re-tente avec les bons paramètres.
-- **`error` / autres** → notifie ⚠️ avec `reason` + `detail`.
+- **`error` / `missing-discord-ids` / `bad-discord-ids`** → escape-hatch CLI mal utilisé. En mode normal n'utilise pas ces args, le script self-discovere.
+- **`error` / `discord-discovery-failed`** → l'API Discord n'a pas pu retrouver le msg Craig. Cause classique : permission `Read Message History` manquante sur `#craig-events` (status 403 dans `detail`). Notifie ⚠️ avec le `detail` brut. **NE PAS** essayer de contourner en écrivant un pending toi-même, **NE PAS** inventer un craig_id, **NE PAS** bypasser le script — le seul vrai fix est côté Discord (config perm).
+- **`error` / autres** → notifie ⚠️ avec `reason` + `detail`. Idem : aucune réécriture manuelle de pending JSON, aucune invention d'ID. Si le script erreur, l'état n'est PAS écrit, point.
+
+## ⛔ Anti-pattern : ne JAMAIS bypass le script
+
+Si le script retourne `status: "error"` :
+- ❌ NE PAS écrire un fichier `.craig-pending/<id>.json` toi-même (write_file, Path.write_text...).
+- ❌ NE PAS prétendre dans Discord que « j'ai forcé l'enregistrement de l'état » ou « j'ai mis en file d'attente » — c'est mensonger.
+- ❌ NE PAS inventer un craig_id si l'extraction a échoué.
+- ✅ Surface le `reason` + `detail` exact dans Discord avec ⚠️, point.
+
+L'utilisateur préfère savoir que rien n'est fait que croire qu'une chose est en cours alors qu'elle ne l'est pas. Un état corrompu écrit par toi est PIRE qu'une erreur affichée — il bloque silencieusement la chaîne pendant des heures.
 
 ## UX live (path `processed` direct, recording déjà terminé)
 
