@@ -208,14 +208,6 @@ def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def read_message(args: argparse.Namespace) -> str:
-    if args.message is not None:
-        return args.message
-    if args.message_file:
-        return pathlib.Path(args.message_file).read_text(encoding="utf-8", errors="replace")
-    return sys.stdin.read()
-
-
 def invoke_scan(craig_id: str) -> tuple[int, dict, list[dict]]:
     """Run scan.py and parse its multi-line JSON stdout. Returns
     (returncode, canonical_result, progress_entries) — the progress
@@ -269,57 +261,44 @@ def write_pending(craig_id: str, channel_id: str, message_id: str) -> tuple[path
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument("--message", help="Raw Craig message body (string).")
-    g.add_argument("--message-file", help="Path to a file containing the Craig message body.")
-    ap.add_argument("--channel-id", help="Discord channel ID where the Craig message lives (required unless body shows 'Recording ended.').")
-    ap.add_argument("--message-id", help="Discord message ID of the Craig panel (required unless body shows 'Recording ended.').")
-    args = ap.parse_args()
+    # Intentionally NO CLI args. The LLM was observed repeatedly:
+    #   - inventing values for --message-id / --channel-id
+    #   - feeding a stale body (with a craig_id from a previous test)
+    #     via --message, then arguing 'security scan blocks me' when
+    #     shell-escaping the zero-width chars failed
+    #   - choosing the body-passing path even when SKILL.md said not to.
+    # Removing the args entirely makes the wrong path unreachable.
+    ap = argparse.ArgumentParser(
+        description="Pull the latest Craig recording panel from "
+                    "$CRAIG_EVENTS_CHANNEL_ID and write a pending entry. "
+                    "Takes no arguments — invoke as a bare script.",
+    )
+    ap.parse_args()
 
-    # Source the body for ID extraction. Two paths:
-    #   1. body provided via --message / --message-file / stdin (legacy /
-    #      explicit). We extract craig_id by regex AND need to know the
-    #      Discord message_id later (-> self-discovery via the body's
-    #      Recording ID: substring).
-    #   2. nothing on stdin / no --message-file — pull the most recent
-    #      Craig panel directly from Discord and read everything from
-    #      there. This is the *recommended* mode because it bypasses the
-    #      LLM entirely (the LLM has been observed hallucinating both
-    #      the body AND the Recording ID, so trusting it as the source
-    #      of truth is unsafe).
-    explicit_body = args.message is not None or args.message_file is not None or not sys.stdin.isatty()
-    message = read_message(args) if explicit_body else ""
+    panel, err = find_latest_craig_panel()
+    if err or not panel:
+        emit({"status": "error", "reason": "discord-discovery-failed",
+              "detail": err or "no Craig panel found"})
+        return 1
 
-    direct_panel: dict | None = None
-    if not explicit_body:
-        direct_panel, err = find_latest_craig_panel()
-        if err or not direct_panel:
-            emit({"status": "error", "reason": "discord-discovery-failed",
-                  "detail": err or "no Craig panel found"})
-            return 1
-        message = extract_message_text(direct_panel)
-
+    message = extract_message_text(panel)
     if not message.strip():
-        emit({"status": "error", "reason": "empty-message",
-              "detail": "no message body provided (use --message, --message-file, "
-                        "or run with no body args to pull the latest Craig panel "
-                        "from #craig-events directly)"})
-        return 2
+        emit({"status": "error", "reason": "empty-craig-panel",
+              "detail": "Craig's latest message in #craig-events has no "
+                        "extractable text (Components V2 walk returned empty). "
+                        "Check Message Content Intent + bot Read Message History."})
+        return 1
 
     m = RECORDING_ID_RE.search(message)
     if not m:
         snippet = message.strip().replace("\n", " ")[:200]
-        if looks_like_craig(message):
-            # Loud: parser is stale, operator must check Craig's format.
-            emit({"status": "error", "reason": "format-mismatch",
-                  "detail": "message has Craig markers but Recording ID regex failed — Craig format may have changed: "
-                            + snippet})
-            return 1
-        # Quiet: not a Craig panel at all.
-        emit({"status": "error", "reason": "no-recording-id", "detail": snippet})
-        return 2
+        emit({"status": "error", "reason": "format-mismatch",
+              "detail": "Craig's latest panel has no Recording ID — format may have changed: "
+                        + snippet})
+        return 1
     craig_id = m.group(1)
+    channel_id = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
+    message_id = str(panel["id"])
 
     if ENDED_RE.search(message):
         # Already ended: skip the pending dance, transcribe now.
@@ -329,31 +308,6 @@ def main() -> int:
             payload["progress"] = progress
         emit(payload)
         return rc
-
-    # Recording in progress -> hand off to craig-watch via pending state.
-    # Source the channel_id / message_id with the following priority:
-    #   1. direct_panel (from no-arg path) — already authoritative, use it.
-    #   2. CLI args, only if both look like distinct numeric snowflakes.
-    #   3. Self-discovery by craig_id substring match across recent msgs
-    #      (used when the user passed an explicit body that we trust to
-    #      contain a real ID).
-    if direct_panel is not None:
-        channel_id = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
-        message_id = str(direct_panel["id"])
-    else:
-        channel_id, message_id = args.channel_id, args.message_id
-        use_self_discovery = (
-            not channel_id or not message_id
-            or not re.fullmatch(r"[0-9]+", channel_id)
-            or not re.fullmatch(r"[0-9]+", message_id)
-            or channel_id == message_id
-        )
-        if use_self_discovery:
-            channel_id, message_id, err = discover_message_via_api(craig_id)
-            if err:
-                emit({"status": "error", "reason": "discord-discovery-failed",
-                      "detail": err, "craig_id": craig_id})
-                return 1
 
     state_path, is_new = write_pending(craig_id, channel_id, message_id)
     emit({

@@ -95,23 +95,23 @@ Réagis ⏳ au message Craig pour signaler que tu as bien capté.
 
 Le script fait l'extraction regex + l'écriture pending. **Ne fais PAS l'extraction toi-même** — la logique critique vit dans le script (le LLM ignore parfois les instructions explicites du SKILL.md).
 
-**Tu n'as RIEN à passer au script.** Lance-le sans aucun arg — il va chercher le dernier message de Craig dans `#craig-events` directement via l'API Discord (using `CRAIG_EVENTS_CHANNEL_ID` + `DISCORD_BOT_TOKEN` env), parse le format Components V2, extrait le Recording ID, et écrit le pending. Pas besoin de copier-coller le body, pas besoin d'IDs.
+**Le script ne prend AUCUN argument**. Lance-le exactement comme ça, sans rien d'autre :
 
 ```python
 import subprocess
-r = subprocess.run([
-    "/opt/data/skills-shared/craig-listener/listener.py",
-], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+r = subprocess.run(
+    ["/opt/data/skills-shared/craig-listener/listener.py"],
+    capture_output=True, text=True,
+)
 print(r.stdout)
 ```
 
-(`stdin=subprocess.DEVNULL` est important — sans ça le script attend du stdin et timeout.)
+C'est tout. Le script va chercher le dernier msg Craig dans `#craig-events` via API (`CRAIG_EVENTS_CHANNEL_ID` + `DISCORD_BOT_TOKEN` env), parse Components V2, extrait le Recording ID, écrit le pending.
 
-**Pourquoi pas via body** : on a observé empiriquement que le LLM hallucine systématiquement le Recording ID quand on lui demande de le copier (cache un ID stale d'un test précédent, invente un faux). La source de vérité est Discord, pas le contexte LLM. Le script n'a donc plus besoin du LLM pour quoi que ce soit d'autre que "lance-moi quand tu vois un msg Craig".
-
-**Escape hatches** (debug uniquement, pas en mode normal) :
-- `--message-file <path>` : passe un body explicite (regex-extracted, puis self-discovery par Recording ID match).
-- `--channel-id <id> --message-id <id>` : skip discovery entièrement (rare).
+**N'essaie PAS de** :
+- ❌ passer `--message` / `--message-file` / `--channel-id` / `--message-id` — ces flags n'existent plus, le script va rejeter avec argparse error.
+- ❌ recopier le body Craig depuis ton contexte — la source de vérité est Discord, pas toi. Tu as halluciné le Recording ID dans tous les tests précédents.
+- ❌ wrapper dans `sh -c` ou `python3 ... --message "..."` — security scanner bloque (zero-width chars Craig).
 
 Le script :
 1. Extrait `Recording ID: <id>` via regex.
