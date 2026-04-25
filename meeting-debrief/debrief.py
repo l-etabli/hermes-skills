@@ -69,6 +69,15 @@ DEBRIEFS_DIR = WIKI_PATH / "raw" / "debriefs"
 PENDING_DIR = WIKI_PATH / ".craig-debriefs-pending"
 SCHEMA_PATH = pathlib.Path(__file__).resolve().parent / "schema.json"
 DISCORD_API = "https://discord.com/api/v10"
+# Cloudflare in front of discord.com refuses python-requests' default
+# UA with `error code: 1010` (browser-signature ban). Discord's spec
+# also explicitly REQUIRES bots to send this exact format:
+# https://discord.com/developers/docs/reference#user-agent
+DISCORD_USER_AGENT = "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)"
+# Discord caps message content at 2000 chars. Leave a buffer for any
+# trailing edits made by dispatch.py (the ✅/❌ annotation lines add a
+# few chars per action) and for safety against width miscounts.
+DISCORD_CONTENT_MAX = 1900
 
 
 def emit(payload: dict) -> None:
@@ -158,6 +167,7 @@ def discord_post(path: str, body: dict) -> tuple[dict | None, str | None]:
             headers={
                 "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
                 "Content-Type": "application/json",
+                "User-Agent": DISCORD_USER_AGENT,
             },
             json=body,
             timeout=15,
@@ -170,6 +180,21 @@ def discord_post(path: str, body: dict) -> tuple[dict | None, str | None]:
         return r.json(), None
     except ValueError:
         return None, f"discord-bad-json: {r.text[:200]}"
+
+
+def truncate_recap(recap: str, max_len: int = DISCORD_CONTENT_MAX) -> str:
+    """Hard-truncate the recap to fit Discord's content cap, preserving
+    the structure as much as possible. Adds a footer marker so the LLM /
+    user knows the recap was cut. The full version remains in
+    raw/debriefs/<slug>.json for archival."""
+    if len(recap) <= max_len:
+        return recap
+    marker = "\n\n_(recap tronqué — voir `raw/debriefs/` pour la version complète)_"
+    cut = max_len - len(marker)
+    if cut < 100:
+        # max_len is absurdly small; take what we can.
+        return recap[:max_len]
+    return recap[:cut].rstrip() + marker
 
 
 def main() -> int:
@@ -234,7 +259,8 @@ def main() -> int:
         return 0
 
     actions = debrief.get("action_items") or []
-    recap_md = format_recap(debrief, transcript_rel)
+    full_recap_md = format_recap(debrief, transcript_rel)
+    recap_md = truncate_recap(full_recap_md)
 
     msg, err = discord_post(
         f"/channels/{DISCORD_HOME_CHANNEL}/messages",

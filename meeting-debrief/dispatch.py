@@ -63,6 +63,10 @@ WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 PENDING_DIR = WIKI_PATH / ".craig-debriefs-pending"
 DISCORD_API = "https://discord.com/api/v10"
+# Cloudflare in front of discord.com refuses python-requests' default
+# UA with `error code: 1010`. Discord's spec also requires this exact
+# format: https://discord.com/developers/docs/reference#user-agent
+DISCORD_USER_AGENT = "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)"
 
 
 def emit(payload: dict) -> None:
@@ -132,6 +136,7 @@ def discord_patch_message(channel_id: str, message_id: str, content: str) -> str
             headers={
                 "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
                 "Content-Type": "application/json",
+                "User-Agent": DISCORD_USER_AGENT,
             },
             json={"content": content},
             timeout=15,

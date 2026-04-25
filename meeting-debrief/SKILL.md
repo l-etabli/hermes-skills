@@ -93,6 +93,12 @@ Quand tu es invoqué par `craig-watch` (step 5) ou manuellement sur un transcrip
 
 2. **Génère le JSON debrief** conforme au schéma ci-dessus. Le contexte wiki déjà chargé par `llm-wiki` t'aide naturellement à inférer le bon `target` (ex. `bug du dropdown étalonnage` → `l-etabli/pilotis`).
 
+   **Contrainte de longueur** : le recap markdown rendu (TLDR + decisions + open_questions + lignes d'action_items) ne doit PAS dépasser **~1800 caractères** une fois formaté — Discord cape le `content` d'un message à 2000 chars et `debrief.py` tronque silencieusement au-delà (avec un footer « recap tronqué »). Pour rester sous la limite :
+   - TLDR concis (3-5 puces, pas un paragraphe entier — l'utilisateur a le transcript complet dans le wiki s'il veut creuser).
+   - Limite-toi aux décisions/open_questions vraiment saillantes (pas de paraphrase exhaustive).
+   - Pour les `action_items`, le `description` doit tenir en 1 phrase ; pousse les détails (repro steps, body issue, etc.) dans `suggested_action.body` qui n'apparaît PAS dans le recap Discord — il sera utilisé seulement par dispatch downstream (issue github, draft mail, …).
+   - Si tu sens que le recap dépasse, retire des `action_items` faibles (`confidence < 0.6`) plutôt que tronquer du contenu high-signal.
+
 3. **Écris-le** dans `$WIKI_PATH/raw/debriefs/<date>-<slug>.json` (le slug est dérivé du nom du transcript, sans l'extension `.md`). Crée le dossier si besoin.
 
 4. **Invoke le script** :
@@ -151,6 +157,14 @@ Quand tu reçois un message Discord :
 - **`.craig-debriefs-pending/`** est gitignoré côté wiki (state runtime, pas knowledge). À ajouter au `.gitignore` du vault si pas déjà fait — voir hermes-infra.
 - **Threads != channels** : Discord traite un thread comme un sous-channel ; le `thread_id` qu'on stocke dans le pending est l'`id` retourné par l'API au moment de la création (`POST /channels/{ch}/messages/{msg}/threads`). C'est ce même id qui apparaît comme `channel_id` sur les messages postés dans le thread.
 - **Pas de re-post du recap** : si le user répond plusieurs fois dans le thread, tu peux dispatcher plusieurs fois (les IDs déjà traités auront été retirés du pending). Ne re-poste JAMAIS le recap initial.
+
+## Anti-patterns LLM (leçons des skills craig-*)
+
+- ❌ **Ne pas inventer un `thread_id`** quand tu invoques `dispatch.py`. Le `thread_id` doit venir de ton contexte Discord réel (le message du user que tu traites est dans un thread, son `channel_id` côté Discord = ce `thread_id`). Si tu ne le retrouves pas, lis directement la liste des pending : `ls $WIKI_PATH/.craig-debriefs-pending/` te donne les `thread_id` actifs. NE devine JAMAIS de snowflake — préfère échouer loud.
+- ❌ **Ne pas écrire le pending JSON ou éditer le recap toi-même** quand `debrief.py` ou `dispatch.py` retourne `error`. Surface l'erreur, point. Un état corrompu écrit par toi est pire qu'une erreur affichée.
+- ❌ **Ne pas wrapper dans `sh -c` / `printf %q`** : si jamais tu dois passer du texte LLM-généré (ex. `body` dans une correction JSON), écris-le via `Path("/tmp/...").write_text(...)` puis passe le chemin. Le scanner sécurité Hermes bloque les zero-width chars sur cmdline.
+- ❌ **Ne pas faire des appels Discord depuis `execute_code` sans le `User-Agent` `DiscordBot (...)`** — Cloudflare bloque le UA Python par défaut avec `error code: 1010`. Les scripts du repo l'envoient déjà ; si tu dois faire un call REST direct, copie-leur ce header.
+- ❌ **Ne pas trust ton parsing du content Discord** : Craig (et d'autres bots modernes) utilisent **Components V2** (`flags & 32768`) — le texte vit dans `components[].components[].content` récursif, pas dans `content`/`embeds`. Pour Craig, on a un `extract_message_text` qui walk dans `craig-listener/listener.py` — réutilise-le si tu dois lire un msg Craig depuis l'API.
 
 ## Verification
 
