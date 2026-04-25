@@ -25,6 +25,11 @@ hermes-skills/
 ├── craig-transcript-record/  # primitive : --craig-id → poll Drive → Groq → raw/
 │   ├── SKILL.md
 │   └── scan.py
+├── meeting-debrief/          # post-ingest : recap Discord + thread de validation + dispatch
+│   ├── SKILL.md
+│   ├── schema.json
+│   ├── debrief.py
+│   └── dispatch.py
 └── …
 ```
 
@@ -106,8 +111,9 @@ Famille **Craig** — capture event-driven des recordings vocaux Discord (Craig 
 | [`craig-watch`](./craig-watch/) | voice | Cron 5 min | Refetch chaque pending via l'API Discord, détecte la transition vers `Recording ended.`, invoque `craig-transcript-record/scan.py`, supprime le pending sur succès. Expire les pending > 24h. |
 | [`craig-scan`](./craig-scan/) | voice | Manuel (utilisateur) | Liste les recordings finis dans l'historique de `#craig-events` qui n'ont jamais été transcrits ni watchés, présente la liste, **attend la sélection utilisateur**, puis transcrit séquentiellement les IDs validés. |
 | [`craig-transcript-record`](./craig-transcript-record/) | voice | `--craig-id <ID>` (appelé par les 3 ci-dessus) | Primitive de transcription : poll Drive (30→60→120s, timeout 20 min), download le zip Craig, mix ffmpeg multi-pistes, Groq Whisper, écrit `raw/transcripts/<date>-craig-<id>-…md`. Idempotent via `drive_id` + `craig_id`. |
+| [`meeting-debrief`](./meeting-debrief/) | voice | Invoqué par `craig-watch` (post-ingest) + event Discord (réponse thread, Phase 2) | Génère un debrief structuré (TLDR + décisions + open questions + action items typés) et le poste dans `DISCORD_HOME_CHANNEL` avec un thread de validation. Phase 2 : dispatche les actions validées vers `github-issues` / `hermes-cron` / `google-workspace` / `obsidian` / `linear`. Idempotent via `transcript_sha256`, gating par durée min (défaut 3 min). |
 
-**Flux typique** : Craig poste `🔴 Recording...` → `craig-listener` écrit pending → recording dure N minutes → Craig édite en `Recording ended.` → `craig-watch` détecte (cron suivant) → invoque `craig-transcript-record/scan.py` → poll Drive jusqu'au zip (cook+upload Craig 1-15 min) → transcription Groq → raw écrit → LLM commit/push + `llm-wiki ingest`.
+**Flux typique** : Craig poste `🔴 Recording...` → `craig-listener` écrit pending → recording dure N minutes → Craig édite en `Recording ended.` → `craig-watch` détecte (cron suivant) → invoque `craig-transcript-record/scan.py` → poll Drive jusqu'au zip (cook+upload Craig 1-15 min) → transcription Groq → raw écrit → LLM commit/push + `llm-wiki ingest` → `meeting-debrief` génère le recap dans `DISCORD_HOME_CHANNEL` avec thread de validation → user valide, `meeting-debrief/dispatch.py` route vers les skills cibles.
 
 **Routing entre instances Hermes** : 100 % Discord (catégorie + rôle). Chaque instance ne voit que SON `#craig-events` via les permissions Discord. Aucune décision de filtrage côté skills.
 
