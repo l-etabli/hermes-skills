@@ -61,7 +61,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-REQUIRED_ENV = ("WIKI_PATH",)
+REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN", "CRAIG_EVENTS_CHANNEL_ID")
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
 if _missing:
     print(json.dumps({"status": "error", "reason": "missing-env",
@@ -79,6 +79,56 @@ SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
 
 RECORDING_ID_RE = re.compile(r"Recording\s+ID\s*:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
 ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
+
+DISCORD_API = "https://discord.com/api/v10"
+
+
+def discover_message_via_api(craig_id: str) -> tuple[str | None, str | None, str | None]:
+    """Find the Discord message that announced this craig_id by listing
+    the recent messages of #craig-events and matching on `Recording ID:
+    <craig_id>` in the body (content + embeds). Used when the LLM didn't
+    provide --channel-id / --message-id (it tends to hallucinate them).
+
+    Returns (channel_id, message_id, error). On success, error is None.
+    """
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    channel_id = os.environ.get("CRAIG_EVENTS_CHANNEL_ID")
+    if not token or not channel_id:
+        return None, None, "missing DISCORD_BOT_TOKEN or CRAIG_EVENTS_CHANNEL_ID env"
+
+    # urllib only — listener.py doesn't otherwise import requests, and we
+    # want this self-discovery to work without uv-with-requests gymnastics.
+    import urllib.request
+    import urllib.error
+
+    url = f"{DISCORD_API}/channels/{channel_id}/messages?limit=25"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bot {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            messages = json.load(r)
+    except urllib.error.HTTPError as e:
+        return None, None, f"discord-{e.code}: {e.read()[:200].decode(errors='replace')}"
+    except Exception as e:
+        return None, None, f"network: {type(e).__name__}: {e}"
+
+    needle = f"Recording ID: {craig_id}"
+    needle_lower = needle.lower()
+    for m in messages:
+        haystack_parts = [m.get("content", "") or ""]
+        for em in m.get("embeds", []) or []:
+            for f in ("title", "description"):
+                v = em.get(f)
+                if v:
+                    haystack_parts.append(v)
+            for fld in em.get("fields", []) or []:
+                v = fld.get("value")
+                if v:
+                    haystack_parts.append(v)
+        haystack = "\n".join(haystack_parts).lower()
+        if needle_lower in haystack:
+            return channel_id, str(m["id"]), None
+
+    return None, None, f"no recent message in channel {channel_id} contains 'Recording ID: {craig_id}'"
 
 # Markers that strongly suggest the message is a Craig recording panel
 # even if our `Recording ID:` regex fails to match (e.g. Craig changed
@@ -200,33 +250,33 @@ def main() -> int:
         return rc
 
     # Recording in progress -> hand off to craig-watch via pending state.
-    if not args.channel_id or not args.message_id:
-        emit({"status": "error", "reason": "missing-discord-ids",
-              "detail": "in-progress recordings require --channel-id and --message-id so craig-watch can refetch the panel",
-              "craig_id": craig_id})
-        return 2
+    # Source the channel_id / message_id with the following priority:
+    #   1. CLI args, when both are provided AND both look like real
+    #      Discord snowflakes (the LLM tends to hallucinate them, so we
+    #      gate aggressively).
+    #   2. Self-discovery via Discord REST API: look up the message by
+    #      `Recording ID: <craig_id>` in the recent #craig-events list.
+    # The CLI overrides exist mostly as an escape hatch for manual runs.
+    channel_id, message_id = args.channel_id, args.message_id
 
-    if not re.fullmatch(r"[0-9]+", args.channel_id) or not re.fullmatch(r"[0-9]+", args.message_id):
-        emit({"status": "error", "reason": "bad-discord-ids",
-              "detail": "channel-id and message-id must be numeric Discord snowflakes",
-              "craig_id": craig_id})
-        return 2
+    use_self_discovery = False
+    if not channel_id or not message_id:
+        use_self_discovery = True
+    elif not re.fullmatch(r"[0-9]+", channel_id) or not re.fullmatch(r"[0-9]+", message_id):
+        # Non-numeric -> not snowflakes, fall back.
+        use_self_discovery = True
+    elif channel_id == message_id:
+        # LLM passed the same value twice — classic hallucination.
+        use_self_discovery = True
 
-    if args.channel_id == args.message_id:
-        # Caught a real LLM mistake: passing the same value for both
-        # collapses the channel/message distinction (the resulting GET
-        # /channels/<X>/messages/<X> Discord call always 404s). Refuse
-        # rather than write a doomed pending entry.
-        emit({"status": "error", "reason": "channel-equals-message",
-              "detail": "--channel-id and --message-id must be different snowflakes "
-                        "(channel-id = the channel where Craig posted, "
-                        "message-id = the Craig panel message itself). "
-                        "You almost certainly passed message.id for both — "
-                        "re-read the source message context and try again.",
-              "craig_id": craig_id})
-        return 2
+    if use_self_discovery:
+        channel_id, message_id, err = discover_message_via_api(craig_id)
+        if err:
+            emit({"status": "error", "reason": "discord-discovery-failed",
+                  "detail": err, "craig_id": craig_id})
+            return 1
 
-    state_path, is_new = write_pending(craig_id, args.channel_id, args.message_id)
+    state_path, is_new = write_pending(craig_id, channel_id, message_id)
     emit({
         "status": "pending" if is_new else "already-pending",
         "craig_id": craig_id,

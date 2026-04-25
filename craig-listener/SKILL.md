@@ -13,6 +13,12 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Chemin absolu vers le vault llm-wiki. Utilisé pour stocker l'état pending dans .craig-pending/ et hérité par craig-transcript-record."
     required_for: full functionality
+  - name: DISCORD_BOT_TOKEN
+    prompt: "Token du bot Discord de cette instance Hermes. Utilisé pour la self-discovery du message_id via l'API REST (le LLM ne sait pas extraire les IDs de son contexte de façon fiable)."
+    required_for: full functionality
+  - name: CRAIG_EVENTS_CHANNEL_ID
+    prompt: "ID du canal Discord #craig-events de cette instance. Utilisé par la self-discovery pour trouver le message Craig correspondant à un Recording ID donné."
+    required_for: full functionality
   - name: GITHUB_TOKEN
     prompt: "Token GitHub pour le push (refresh via la GitHub App). Hérité par craig-transcript-record."
     required_for: full functionality
@@ -89,22 +95,16 @@ Réagis ⏳ au message Craig pour signaler que tu as bien capté.
 
 Le script fait l'extraction regex + l'écriture pending. **Ne fais PAS l'extraction toi-même** — la logique critique vit dans le script (le LLM ignore parfois les instructions explicites du SKILL.md).
 
-Tu DOIS passer `--channel-id` ET `--message-id` (DEUX valeurs DIFFÉRENTES) :
-
-- **`--channel-id`** = ID du **canal** `#craig-events` (où Craig vient de poster). Dans le contexte Discord d'Hermes : **`message.channel.id`** ou équivalent platform context (`event.channel_id`, `payload["channel_id"]`...). C'est l'ID du SALON, pas du message.
-- **`--message-id`** = ID du **message** Craig que tu es en train de traiter. Dans le contexte : **`message.id`** ou `event.message_id`. C'est l'ID du MESSAGE individuel.
-
-⚠️ **Erreur fréquente** : passer `message.id` (ou son équivalent) pour LES DEUX champs. Le résultat est un pending JSON où `channel_id == message_id`, et au prochain tick craig-watch `GET /channels/<X>/messages/<X>` renverra 404 et la chaîne se bloque jusqu'à expiration. Le script REFUSE désormais ce cas avec `reason: "channel-equals-message"` — si tu vois cette erreur, relis le contexte source du message et extrais les deux IDs **distincts**.
-
-**Méthode recommandée — `--message-file` via tmpfile écrit hors shell** :
-le body Craig contient des zero-width chars (U+200B) que le security scanner Hermes flag si on l'inclut sur la cmdline shell (`printf %q "..."`, `sh -c`). Écris le body dans un tmpfile via un outil non-shell (write_file ou équivalent Python natif) puis passe `--message-file` :
+Tu n'as **PAS** besoin de connaître ni de passer le `channel_id` ou le `message_id` — le script les découvre lui-même via l'API Discord (`GET /channels/$CRAIG_EVENTS_CHANNEL_ID/messages?limit=25` puis match sur `Recording ID: <id>` dans le body). Passe juste le body Craig via `--message-file`.
 
 ```python
-# 1) Écris le body dans un tmpfile (PAS via shell)
+# 1) Écris le body Craig dans un tmpfile (PAS via shell — Craig embed des
+#    zero-width chars U+200B que le scanner sécurité Hermes flag si on les
+#    met sur la cmdline `sh -c` ou `printf %q`).
 from pathlib import Path
 Path("/tmp/craig-msg.txt").write_text(craig_message_body, encoding="utf-8")
 
-# 2) Invoke le script avec --message-file (cmdline propre, pas de body inline)
+# 2) Invoke listener.py avec --message-file uniquement.
 import subprocess
 r = subprocess.run([
     "uv", "run",
@@ -113,13 +113,13 @@ r = subprocess.run([
     "--with", "requests",
     "/opt/data/skills-shared/craig-listener/listener.py",
     "--message-file", "/tmp/craig-msg.txt",
-    "--channel-id", channel_id,
-    "--message-id", message_id,
 ], capture_output=True, text=True)
 print(r.stdout)
 ```
 
 **Ne PAS utiliser `printf '%s' "<body>" | ...` ni `sh -c`** : le scanner sécurité bloque (zero-width chars dans le body Craig).
+
+`--channel-id` et `--message-id` existent comme escape hatch pour des runs manuels (debug, replay), mais en mode normal **ne les passe pas** — le LLM tend à les inventer, et le script discovery est plus fiable.
 
 Le script :
 1. Extrait `Recording ID: <id>` via regex.
