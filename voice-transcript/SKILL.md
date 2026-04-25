@@ -1,7 +1,7 @@
 ---
 name: voice-transcript
 description: "Scanne un dossier Google Drive, transcrit via Groq Whisper tout audio nouveau (zips Craig, voice notes, exports Zoom, mp3/m4a/wav/flac/ogg), dépose le résultat dans raw/transcripts/ d'un wiki llm-wiki et enchaîne l'opération ingest du skill llm-wiki. Idempotent via sha256."
-version: 1.2.0
+version: 2.0.0
 platforms: [linux]
 metadata:
   hermes:
@@ -25,6 +25,9 @@ required_environment_variables:
   - name: GROQ_API_KEY
     prompt: "Clé API Groq (https://console.groq.com/keys) pour la transcription Whisper Large v3 Turbo."
     required_for: full functionality
+  - name: HERMES_OWNED_CHANNEL_IDS
+    prompt: "Liste CSV d'IDs de channels Discord 'possédés' par cette instance (ex. 1497178585759485952,1497178585759485953). Chaque zip Craig contient un info.txt qui mentionne le Channel ID; le skill ne traite que les zips dont le Channel ID est dans cette liste. On filtre sur les channels et non sur la guild car plusieurs instances Hermes peuvent vivre sur le même serveur Discord, chacune écoutant un sous-ensemble de salons. Vide ou non défini = pas de filtrage (mode mono-instance)."
+    required_for: multi-instance setups
 ---
 
 # Voice Transcript
@@ -43,6 +46,18 @@ Tout fichier déposé dans le dossier Drive `AUDIO_DRIVE_FOLDER_ID` :
 - **Audio direct** (`.mp3`, `.m4a`, `.wav`, `.flac`, `.ogg`) — déposé manuellement par l'utilisateur (export Zoom, voice memo, podcast, etc.). Envoyé à Groq tel quel.
 
 Pas besoin d'URL ni de nom de fichier : le skill liste, filtre, et traite tout ce qui est nouveau.
+
+## Cohabitation multi-instances
+
+Plusieurs instances Hermes (`perso`, `piloti`, `telluris`) peuvent partager le **même dossier Drive** (Craig n'a qu'une seule destination d'upload par compte Patreon, et plusieurs instances peuvent vivre sur le même serveur Discord avec des channels distincts). Le filtrage par "instance owner" se fait au niveau de `scan.py` via `HERMES_OWNED_CHANNEL_IDS` — **purement déterministe, pas de décision LLM** :
+
+- Pour chaque zip Craig, `scan.py` ouvre `info.txt` (présent à l'intérieur du zip) et y lit le **Channel ID Discord** (ligne `Channel: <name> (<id>)` — la regex capture uniquement l'ID numérique, pas le nom, donc renommer un channel ne casse rien).
+- Si le Channel ID n'est pas dans `HERMES_OWNED_CHANNEL_IDS`, le zip est marqué `foreign-channel` et ignoré silencieusement — c'est le boulot d'une autre instance.
+- Si `HERMES_OWNED_CHANNEL_IDS` est vide ou non défini, **aucun filtrage** — utile en mono-instance ou pour debug.
+
+Pour les **audio directs** (sans `info.txt`), il n'y a pas de discriminator. Conséquence :
+- En **mode auto-scan** (cron, ou demande générique « scanne le drive »), les audio directs sont **ignorés** quand `HERMES_OWNED_CHANNEL_IDS` est non vide (`manual-audio-no-discriminator`), pour éviter le traitement parallèle par plusieurs instances.
+- En **mode trigger explicite** (`--filename meeting.mp3`, ou demande utilisateur ciblée sur un fichier précis), le filtrage Channel est court-circuité et le fichier est traité par l'instance qui reçoit la demande.
 
 ## When to Use
 
@@ -92,239 +107,49 @@ command -v uv && command -v ffmpeg && \
 
 Si une étape fail, abandonne et signale précisément quoi manque.
 
-### 2. Écris le script de scan dans un tmpdir
+### 2. Lance `scan.py` (script versionné, livré avec le skill)
 
-Tout le travail de capture (Phase A) tient dans un seul script Python lancé via `uv run`. Voici le template — adapte si besoin mais n'invente pas de variantes :
+Le script de capture (Phase A) est **versionné dans le repo skills**, à côté de ce SKILL.md : `voice-transcript/scan.py`. Il fait tout en code déterministe — listing Drive, dédup via `drive_id`, lecture de `info.txt` pour le filtrage par Channel ID, mix ffmpeg multi-pistes, Groq, écriture du raw avec frontmatter complet. **Ne le réécris pas, ne le copie pas dans un tmpdir, ne fais pas de variante.** Tu l'invoques tel quel.
 
-```python
-# Écris ce contenu dans <tmpdir>/scan.py via write_file
-"""
-voice-transcript scan: list Drive folder, transcribe new audio via Groq,
-write to $WIKI_PATH/raw/transcripts/, return JSON summary on stdout.
-"""
-import hashlib, io, json, os, pathlib, re, subprocess, sys, tempfile, time, zipfile, unicodedata
-from datetime import datetime, timezone
-import requests
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2 import service_account
-
-WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
-TRANSCRIPTS_DIR = WIKI_PATH / "raw" / "transcripts"
-TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-
-CRAIG_RECORDING_ID = os.environ.get("CRAIG_RECORDING_ID")  # optional filter
-
-def slugify(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
-    s = re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower()
-    return s or "audio"
-
-def s_to_ts(s):
-    s = int(s); h, r = divmod(s, 3600); m, sec = divmod(r, 60)
-    return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
-
-def already_transcribed(drive_id):
-    for md in TRANSCRIPTS_DIR.glob("*.md"):
-        if f"drive_id: {drive_id}" in md.read_text(encoding="utf-8", errors="replace")[:1500]:
-            return md.name
-    return None
-
-def list_candidates(drive, folder_id):
-    name_clauses = [
-        "name contains '.flac.zip'", "mimeType contains 'audio/'",
-        "name contains '.mp3'", "name contains '.m4a'",
-        "name contains '.wav'", "name contains '.flac'", "name contains '.ogg'",
-    ]
-    q = f"'{folder_id}' in parents and trashed=false and ({' or '.join(name_clauses)})"
-    if CRAIG_RECORDING_ID:
-        q += f" and name contains 'craig_{CRAIG_RECORDING_ID}_'"
-    return drive.files().list(
-        q=q, orderBy="createdTime desc",
-        fields="files(id,name,createdTime,size,mimeType,md5Checksum)",
-        pageSize=50,
-    ).execute().get("files", [])
-
-def download_to(drive, file_id, dst: pathlib.Path):
-    buf = io.BytesIO()
-    dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=file_id))
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    dst.write_bytes(buf.getvalue())
-
-def prepare_audio(drive, f, tmpdir: pathlib.Path):
-    """Returns (audio_path, speakers, source) where source ∈ {'craig','manual'}."""
-    name = f["name"]
-    if name.endswith(".flac.zip"):
-        zip_path = tmpdir / name
-        download_to(drive, f["id"], zip_path)
-        flac_paths = []
-        with zipfile.ZipFile(zip_path) as zf:
-            for zi in zf.infolist():
-                if zi.filename.lower().endswith(".flac"):
-                    p = tmpdir / pathlib.Path(zi.filename).name
-                    p.write_bytes(zf.read(zi))
-                    flac_paths.append(p)
-        speakers = [p.stem.split("-", 1)[-1] for p in flac_paths]
-        if len(flac_paths) == 1:
-            return flac_paths[0], speakers, "craig"
-        out = tmpdir / "mix.flac"
-        cmd = ["ffmpeg", "-y", "-loglevel", "error"]
-        for p in flac_paths:
-            cmd += ["-i", str(p)]
-        cmd += ["-filter_complex", f"amix=inputs={len(flac_paths)}:normalize=0",
-                "-c:a", "flac", str(out)]
-        subprocess.run(cmd, check=True)
-        return out, speakers, "craig"
-    out = tmpdir / name
-    download_to(drive, f["id"], out)
-    return out, [], "manual"
-
-def transcribe_groq(audio_path: pathlib.Path):
-    size = audio_path.stat().st_size
-    if size > 25 * 1024 * 1024:
-        raise RuntimeError(f"audio {size/1e6:.1f}MB > 25MB Groq limit; re-encode lower or split")
-    with open(audio_path, "rb") as fh:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"},
-            files={"file": (audio_path.name, fh, "audio/flac")},
-            data={
-                "model": "whisper-large-v3-turbo",
-                "response_format": "verbose_json",
-                "language": "fr",
-                "temperature": "0",
-            },
-            timeout=300,
-        )
-    r.raise_for_status()
-    return r.json()
-
-def parse_recorded_at(name, source, drive_created):
-    if source == "craig":
-        m = re.search(r"craig_[A-Za-z0-9]+_(\d{4})-(\d{1,2})-(\d{1,2})_(\d{1,2})-(\d{1,2})-(\d{1,2})", name)
-        if m:
-            y, mo, d, h, mi, s = map(int, m.groups())
-            return datetime(y, mo, d, h, mi, s).strftime("%Y-%m-%d %H:%M")
-    # fallback drive createdTime (RFC3339, e.g. 2026-04-25T08:14:32.000Z)
-    try:
-        return datetime.fromisoformat(drive_created.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
-def write_transcript(f, audio_path, transcription, speakers, source, tmpdir):
-    name = f["name"]
-    recorded_at = parse_recorded_at(name, source, f.get("createdTime", ""))
-    date = recorded_at.split(" ")[0]
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    duration_s = int(transcription.get("duration", 0))
-    dur_text = f"{duration_s // 60}m {duration_s % 60}s"
-    lang = transcription.get("language", "?")
-
-    # slug: source-aware
-    if source == "craig":
-        m = re.search(r"craig_([A-Za-z0-9]+)_", name)
-        slug = f"craig-{m.group(1).lower()}-{slugify(date)}" if m else f"audio-{f['id'][:8]}"
-    else:
-        stem = pathlib.Path(name).stem
-        slug = slugify(stem) or f"audio-{f['id'][:8]}"
-
-    src_url = (f"https://craig.horse/rec/{re.search(r'craig_([A-Za-z0-9]+)_', name).group(1)}"
-               if source == "craig" else
-               f"drive://{os.environ['AUDIO_DRIVE_FOLDER_ID']}/{name}")
-
-    speakers_line = ", ".join(speakers) if speakers else "???"
-    single_speaker = speakers[0] if len(speakers) == 1 else None
-    body_lines = []
-    for seg in transcription.get("segments", []):
-        ts = s_to_ts(seg["start"])
-        sp = single_speaker or "???"
-        body_lines.append(f"[{ts}] **{sp}**: {seg['text'].strip()}\n")
-    body = "\n".join(body_lines).rstrip() + "\n"
-
-    body_full = (
-        f"# Transcription {slug}\n\n"
-        f"- **Source audio** : `{name}`\n"
-        f"- **Date** : {recorded_at}\n"
-        f"- **Durée** : {dur_text}\n"
-        f"- **Participants** : {speakers_line}\n"
-        f"- **Transcription** : Groq Whisper Large v3 Turbo (langue détectée : `{lang}`)\n\n"
-        f"{body}"
-    )
-    sha = hashlib.sha256(body_full.encode("utf-8")).hexdigest()
-    fm = (
-        f"---\n"
-        f"source: {source}\n"
-        f"drive_id: {f['id']}\n"
-        f"drive_md5: {f.get('md5Checksum','')}\n"
-        f"recorded_at: {recorded_at}\n"
-        f"ingested: {today}\n"
-        f"sha256: {sha}\n"
-        f"---\n\n"
-    )
-    out_path = TRANSCRIPTS_DIR / f"{date}-{slug}.md"
-    if out_path.exists():
-        # idempotent shield (the loop already filters by drive_id, but in
-        # case the user replaced a file with the same name we fork the slug)
-        existing = out_path.read_text(encoding="utf-8", errors="replace")[:1500]
-        if f"drive_id: {f['id']}" in existing:
-            return None  # already there
-        out_path = TRANSCRIPTS_DIR / f"{date}-{slug}-2.md"
-    out_path.write_text(fm + body_full, encoding="utf-8")
-    return out_path
-
-def main():
-    folder_id = os.environ["AUDIO_DRIVE_FOLDER_ID"]
-    creds = service_account.Credentials.from_service_account_file(
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-
-    candidates = list_candidates(drive, folder_id)
-    if not candidates:
-        print(json.dumps({"new": [], "skipped": [], "reason": "drive folder is empty or SA has no access"}))
-        return
-    new_files, skipped = [], []
-    with tempfile.TemporaryDirectory() as td:
-        tmpdir = pathlib.Path(td)
-        for f in candidates:
-            existing = already_transcribed(f["id"])
-            if existing:
-                skipped.append({"name": f["name"], "as": existing})
-                continue
-            try:
-                audio, speakers, source = prepare_audio(drive, f, tmpdir)
-                tx = transcribe_groq(audio)
-                out = write_transcript(f, audio, tx, speakers, source, tmpdir)
-                if out:
-                    new_files.append(str(out.relative_to(WIKI_PATH)))
-            except Exception as exc:
-                skipped.append({"name": f["name"], "error": str(exc)})
-    print(json.dumps({"new": new_files, "skipped": skipped}))
-
-if __name__ == "__main__":
-    main()
-```
-
-### 3. Lance le script via `uv run`
+Chemin canonique côté container : `/opt/data/skills-shared/voice-transcript/scan.py`.
 
 ```bash
-TMPDIR=$(mktemp -d)
-write_file "$TMPDIR/scan.py"   # avec le contenu ci-dessus
-uv run --with requests --with google-auth --with google-api-python-client \
-    "$TMPDIR/scan.py"
-rm -rf "$TMPDIR"
+# Mode auto-scan (cron ou demande générique « scanne le drive »)
+uv run --with google-auth --with google-api-python-client --with requests \
+    /opt/data/skills-shared/voice-transcript/scan.py
+
+# Mode trigger explicite (l'utilisateur cite un nom de fichier précis)
+uv run --with google-auth --with google-api-python-client --with requests \
+    /opt/data/skills-shared/voice-transcript/scan.py --filename "meeting.mp3"
+
+# Mode URL Craig (extrait le recording_id de l'URL et restreint au zip correspondant)
+uv run --with google-auth --with google-api-python-client --with requests \
+    /opt/data/skills-shared/voice-transcript/scan.py --craig-id "ZLY9jcKKaL5x"
 ```
 
-La sortie est un JSON `{"new": ["raw/transcripts/...", ...], "skipped": [{"name": "...", "as": "..."}, ...]}`. Parse-le pour la suite.
+La sortie est un JSON :
 
-Si `new` est vide et `skipped` ne contient que des entrées `"as"` (déjà transcrits) → tout est à jour, signale-le et stoppe ici (sans message bruyant si trigger = cron).
+```json
+{
+  "new":     ["raw/transcripts/2026-04-25-craig-xxx.md", ...],
+  "skipped": [{"name": "...", "reason": "already-transcribed", "as": "..."}, ...],
+  "errors":  [{"name": "...", "error": "..."}]
+}
+```
+
+Sémantique des `reason` côté `skipped` :
+- `already-transcribed` : `drive_id` déjà présent dans un raw existant, idempotence OK
+- `foreign-channel` : zip Craig provenant d'un Channel Discord pas dans `HERMES_OWNED_CHANNEL_IDS` → c'est le boulot d'une autre instance Hermes
+- `no-channel-info` : `info.txt` absent ou ne mentionne pas de Channel ID → on ne sait pas à qui ça appartient, on skip par sécurité (uniquement en auto-scan, pas en trigger explicite)
+- `manual-audio-no-discriminator` : audio direct (sans `info.txt`) en mode auto-scan multi-instance → on évite que les 3 instances le transcrivent en parallèle. À traiter via trigger explicite (`--filename`).
+- `empty-transcription` : Groq a rendu 0 segment (silence)
+- `race-already-written` : un autre process a écrit le fichier entre la dédup et l'écriture (rare)
+
+Parse le JSON pour la suite. Si `new` est vide et il n'y a que des `skipped` (raisons normales), signale « rien de nouveau » et stoppe (silencieux côté Discord si trigger = cron).
 
 Si `skipped` contient des `"error"` → log les erreurs, continue avec les `new` malgré tout.
 
-### 4. Commit + push des nouveaux raws
+### 3. Commit + push des nouveaux raws
 
 Pour chaque entrée de `new` :
 
@@ -338,7 +163,7 @@ git push
 
 L'auth est gérée par le credential helper installé côté infra (lit `$GITHUB_TOKEN` à chaque op), aucune manipulation de token n'est nécessaire. Si le push échoue avec une erreur d'auth, attends 60 s (le sidecar refresh le token toutes les 45 min) et retry une fois. Au-delà, log et passe au candidat suivant — le raw est déjà committé localement, le push se rattrape au prochain run.
 
-### 5. Enchaîne l'ingestion (Phase B)
+### 4. Enchaîne l'ingestion (Phase B)
 
 Pour chaque entrée de `new`, active le skill `llm-wiki` (`skill_view("llm-wiki")` si pas en contexte) et applique son opération **`ingest`** sur le fichier.
 
@@ -346,7 +171,7 @@ Suis intégralement la procédure d'ingest du skill `llm-wiki` (section `## Core
 
 Si l'ingest échoue : ne fail pas tout. Le raw a déjà été commité. Notifie ⚠️ et signale clairement à l'utilisateur ce qui a bloqué.
 
-### 6. Confirme l'enchaînement
+### 5. Confirme l'enchaînement
 
 Une fois la phase A et B réussies pour un audio, poste un message court (Discord ou stdout selon trigger) :
 
