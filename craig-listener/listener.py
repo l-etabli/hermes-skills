@@ -118,24 +118,54 @@ def discover_message_via_api(craig_id: str) -> tuple[str | None, str | None, str
     except Exception as e:
         return None, None, f"network: {type(e).__name__}: {e}"
 
-    needle = f"Recording ID: {craig_id}"
-    needle_lower = needle.lower()
+    # Lower-case match accommodates Craig's bold formatting `**Recording ID:**`
+    # which doesn't change the text content but the regex needle is plain.
+    # Match on the bare 'recording id: <id>' substring (post-lowercase).
+    needle_lower = f"recording id: {craig_id}".lower()
     for m in messages:
-        haystack_parts = [m.get("content", "") or ""]
-        for em in m.get("embeds", []) or []:
-            for f in ("title", "description"):
-                v = em.get(f)
-                if v:
-                    haystack_parts.append(v)
-            for fld in em.get("fields", []) or []:
-                v = fld.get("value")
-                if v:
-                    haystack_parts.append(v)
-        haystack = "\n".join(haystack_parts).lower()
-        if needle_lower in haystack:
+        if needle_lower in extract_message_text(m).lower():
             return channel_id, str(m["id"]), None
 
-    return None, None, f"no recent message in channel {channel_id} contains 'Recording ID: {craig_id}'"
+    return None, None, (
+        f"no recent message in channel {channel_id} contains "
+        f"'Recording ID: {craig_id}'. Note Craig uses Discord Components V2 "
+        f"(flags=32800) — text lives in components[].content, not embeds."
+    )
+
+
+def extract_message_text(msg: dict) -> str:
+    """Concatenate all text-bearing fields of a Discord message object.
+
+    Covers: top-level `content`, classic `embeds[].title/description/fields`,
+    AND Components V2 `components[].content` recursively (Craig's recording
+    panel uses Components V2 — `flags & 32768`, IS_COMPONENTS_V2 — and the
+    panel text lives inside nested TextDisplay blocks at
+    `components[].components[].content`, NOT in `.content` or `.embeds`).
+    """
+    parts: list[str] = [msg.get("content") or ""]
+    for em in msg.get("embeds") or []:
+        for f in ("title", "description"):
+            v = em.get(f)
+            if v:
+                parts.append(v)
+        for fld in em.get("fields") or []:
+            v = fld.get("value")
+            if v:
+                parts.append(v)
+
+    def walk(node):
+        if isinstance(node, dict):
+            v = node.get("content")
+            if isinstance(v, str) and v:
+                parts.append(v)
+            for child in node.get("components") or []:
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(msg.get("components") or [])
+    return "\n".join(parts)
 
 # Markers that strongly suggest the message is a Craig recording panel
 # even if our `Recording ID:` regex fails to match (e.g. Craig changed

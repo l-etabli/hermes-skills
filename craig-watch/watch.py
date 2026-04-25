@@ -112,8 +112,17 @@ def fetch_message(channel_id: str, message_id: str) -> tuple[dict | None, str | 
 
 
 def message_body(msg: dict) -> str:
-    """Concatenate the message content + all embed text fields."""
-    parts = [msg.get("content", "") or ""]
+    """Concatenate every text-bearing field of a Discord message.
+
+    Covers: top-level `content`, classic `embeds[].title/description/fields`
+    + author/footer, AND **Components V2** `components[].content` walked
+    recursively. Craig's recording panel uses Components V2 (flags=32800,
+    IS_COMPONENTS_V2) — the panel text including `Recording ended.` lives
+    inside nested TextDisplay blocks at components[].components[].content,
+    NOT in `.content` or `.embeds`. Without the recursive walk, ENDED_RE
+    never matches and craig-watch sits on the pending forever.
+    """
+    parts: list[str] = [msg.get("content", "") or ""]
     for em in msg.get("embeds", []) or []:
         for field in ("title", "description"):
             v = em.get(field)
@@ -131,6 +140,19 @@ def message_body(msg: dict) -> str:
         footer = (em.get("footer") or {}).get("text")
         if footer:
             parts.append(footer)
+
+    def walk(node):
+        if isinstance(node, dict):
+            v = node.get("content")
+            if isinstance(v, str) and v:
+                parts.append(v)
+            for child in node.get("components") or []:
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(msg.get("components") or [])
     return "\n".join(parts)
 
 
