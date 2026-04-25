@@ -13,6 +13,12 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Chemin absolu vers le vault llm-wiki. Utilisé pour stocker l'état pending dans .craig-pending/ et hérité par craig-transcript-record."
     required_for: full functionality
+  - name: DISCORD_BOT_TOKEN
+    prompt: "Token du bot Discord de cette instance Hermes. Utilisé pour la self-discovery du message_id via l'API REST (le LLM ne sait pas extraire les IDs de son contexte de façon fiable)."
+    required_for: full functionality
+  - name: CRAIG_EVENTS_CHANNEL_ID
+    prompt: "ID du canal Discord #craig-events de cette instance. Utilisé par la self-discovery pour trouver le message Craig correspondant à un Recording ID donné."
+    required_for: full functionality
   - name: GITHUB_TOKEN
     prompt: "Token GitHub pour le push (refresh via la GitHub App). Hérité par craig-transcript-record."
     required_for: full functionality
@@ -89,32 +95,23 @@ Réagis ⏳ au message Craig pour signaler que tu as bien capté.
 
 Le script fait l'extraction regex + l'écriture pending. **Ne fais PAS l'extraction toi-même** — la logique critique vit dans le script (le LLM ignore parfois les instructions explicites du SKILL.md).
 
-Tu DOIS passer `--channel-id` et `--message-id` (lus depuis ton contexte Discord : `message.channel.id` et `message.id`) en plus du body.
-
-**Méthode recommandée — `--message-file` via tmpfile écrit hors shell** :
-le body Craig contient des zero-width chars (U+200B) que le security scanner Hermes flag si on l'inclut sur la cmdline shell (`printf %q "..."`, `sh -c`). Écris le body dans un tmpfile via un outil non-shell (write_file ou équivalent Python natif) puis passe `--message-file` :
+**Le script ne prend AUCUN argument**. Lance-le exactement comme ça, sans rien d'autre :
 
 ```python
-# 1) Écris le body dans un tmpfile (PAS via shell)
-from pathlib import Path
-Path("/tmp/craig-msg.txt").write_text(craig_message_body, encoding="utf-8")
-
-# 2) Invoke le script avec --message-file (cmdline propre, pas de body inline)
 import subprocess
-r = subprocess.run([
-    "uv", "run",
-    "--with", "google-auth",
-    "--with", "google-api-python-client",
-    "--with", "requests",
-    "/opt/data/skills-shared/craig-listener/listener.py",
-    "--message-file", "/tmp/craig-msg.txt",
-    "--channel-id", channel_id,
-    "--message-id", message_id,
-], capture_output=True, text=True)
+r = subprocess.run(
+    ["/opt/data/skills-shared/craig-listener/listener.py"],
+    capture_output=True, text=True,
+)
 print(r.stdout)
 ```
 
-**Ne PAS utiliser `printf '%s' "<body>" | ...` ni `sh -c`** : le scanner sécurité bloque (zero-width chars dans le body Craig).
+C'est tout. Le script va chercher le dernier msg Craig dans `#craig-events` via API (`CRAIG_EVENTS_CHANNEL_ID` + `DISCORD_BOT_TOKEN` env), parse Components V2, extrait le Recording ID, écrit le pending.
+
+**N'essaie PAS de** :
+- ❌ passer `--message` / `--message-file` / `--channel-id` / `--message-id` — ces flags n'existent plus, le script va rejeter avec argparse error.
+- ❌ recopier le body Craig depuis ton contexte — la source de vérité est Discord, pas toi. Tu as halluciné le Recording ID dans tous les tests précédents.
+- ❌ wrapper dans `sh -c` ou `python3 ... --message "..."` — security scanner bloque (zero-width chars Craig).
 
 Le script :
 1. Extrait `Recording ID: <id>` via regex.
@@ -138,8 +135,19 @@ Le script :
 - **`skipped` / `already-transcribed`** → réagis ✅ pour confirmer qu'on est au courant.
 - **`error` / `no-recording-id`** → ce n'était pas un message Craig de recording. Retire la réaction ⏳, ignore silencieusement.
 - **`error` / `format-mismatch`** → ⚠️ **bruyant** : le message ressemble à un panel Craig (présence de `🔴 Recording`, `Voice Region:`, etc.) mais la regex `Recording ID:` a échoué. Très probablement le format Craig a changé. Notifie l'utilisateur avec le snippet, pour qu'on puisse mettre à jour la regex. Ne plus jamais ignorer silencieusement ce cas — sinon on arrête de transcrire sans s'en rendre compte.
-- **`error` / `missing-discord-ids` / `bad-discord-ids`** → tu as oublié de passer `--channel-id` ou `--message-id`. Re-tente avec les bons paramètres.
-- **`error` / autres** → notifie ⚠️ avec `reason` + `detail`.
+- **`error` / `missing-discord-ids` / `bad-discord-ids`** → escape-hatch CLI mal utilisé. En mode normal n'utilise pas ces args, le script self-discovere.
+- **`error` / `discord-discovery-failed`** → l'API Discord n'a pas pu retrouver le msg Craig. Cause classique : permission `Read Message History` manquante sur `#craig-events` (status 403 dans `detail`). Notifie ⚠️ avec le `detail` brut. **NE PAS** essayer de contourner en écrivant un pending toi-même, **NE PAS** inventer un craig_id, **NE PAS** bypasser le script — le seul vrai fix est côté Discord (config perm).
+- **`error` / autres** → notifie ⚠️ avec `reason` + `detail`. Idem : aucune réécriture manuelle de pending JSON, aucune invention d'ID. Si le script erreur, l'état n'est PAS écrit, point.
+
+## ⛔ Anti-pattern : ne JAMAIS bypass le script
+
+Si le script retourne `status: "error"` :
+- ❌ NE PAS écrire un fichier `.craig-pending/<id>.json` toi-même (write_file, Path.write_text...).
+- ❌ NE PAS prétendre dans Discord que « j'ai forcé l'enregistrement de l'état » ou « j'ai mis en file d'attente » — c'est mensonger.
+- ❌ NE PAS inventer un craig_id si l'extraction a échoué.
+- ✅ Surface le `reason` + `detail` exact dans Discord avec ⚠️, point.
+
+L'utilisateur préfère savoir que rien n'est fait que croire qu'une chose est en cours alors qu'elle ne l'est pas. Un état corrompu écrit par toi est PIRE qu'une erreur affichée — il bloque silencieusement la chaîne pendant des heures.
 
 ## UX live (path `processed` direct, recording déjà terminé)
 

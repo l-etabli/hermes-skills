@@ -61,7 +61,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-REQUIRED_ENV = ("WIKI_PATH",)
+REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN", "CRAIG_EVENTS_CHANNEL_ID")
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
 if _missing:
     print(json.dumps({"status": "error", "reason": "missing-env",
@@ -77,8 +77,122 @@ SKILLS_ROOT = pathlib.Path(
 )
 SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
 
-RECORDING_ID_RE = re.compile(r"Recording\s+ID\s*:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+RECORDING_ID_RE = re.compile(
+    # Craig in Components V2 writes `**Recording ID:** \`<id>\``, so we
+    # have to skip past stray markdown wrappers (** for bold, backticks
+    # for code) on either side of the literal `Recording ID:` and again
+    # before the id token. Whitespace + those two characters only.
+    r"Recording[\s*]*ID[\s*]*:[\s*`]*([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
 ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
+
+DISCORD_API = "https://discord.com/api/v10"
+
+
+def fetch_recent_messages() -> tuple[list[dict], str | None]:
+    """List the most recent messages of #craig-events. Returns (msgs, err)."""
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    channel_id = os.environ.get("CRAIG_EVENTS_CHANNEL_ID")
+    if not token or not channel_id:
+        return [], "missing DISCORD_BOT_TOKEN or CRAIG_EVENTS_CHANNEL_ID env"
+
+    import urllib.request
+    import urllib.error
+
+    url = f"{DISCORD_API}/channels/{channel_id}/messages?limit=25"
+    # Cloudflare in front of discord.com refuses the default
+    # Python-urllib User-Agent with `error code: 1010` (browser-signature
+    # ban). Discord's API spec also REQUIRES bots to send this exact
+    # format: https://discord.com/developers/docs/reference#user-agent
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bot {token}",
+        "User-Agent": "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r), None
+    except urllib.error.HTTPError as e:
+        return [], f"discord-{e.code}: {e.read()[:200].decode(errors='replace')}"
+    except Exception as e:
+        return [], f"network: {type(e).__name__}: {e}"
+
+
+# Craig's well-known bot user ID. We use this to filter the channel
+# listing for *Craig's* most recent panel rather than picking up replies
+# from humans / other bots / Hermes itself.
+CRAIG_BOT_USER_ID = "272937604339466240"
+
+
+def find_latest_craig_panel() -> tuple[dict | None, str | None]:
+    """Pull the most recent message authored by Craig in #craig-events.
+    Returns (message, err). Used by the no-arg invocation path: instead
+    of trusting the LLM to pass a body or IDs, we go straight to the
+    source of truth on Discord."""
+    msgs, err = fetch_recent_messages()
+    if err:
+        return None, err
+    for m in msgs:
+        author = m.get("author") or {}
+        if str(author.get("id") or "") == CRAIG_BOT_USER_ID:
+            return m, None
+    return None, f"no recent Craig message (author.id={CRAIG_BOT_USER_ID}) in #craig-events"
+
+
+def discover_message_via_api(craig_id: str) -> tuple[str | None, str | None, str | None]:
+    """Find the Discord message that announced this craig_id by listing
+    the recent messages of #craig-events and matching on `Recording ID:
+    <craig_id>` in the body (content + embeds + components V2). Used as
+    a fallback when an explicit craig_id was passed by the caller (e.g.
+    a manual debug run)."""
+    channel_id = os.environ.get("CRAIG_EVENTS_CHANNEL_ID")
+    msgs, err = fetch_recent_messages()
+    if err:
+        return None, None, err
+    needle_lower = f"recording id: {craig_id}".lower()
+    for m in msgs:
+        if needle_lower in extract_message_text(m).lower():
+            return channel_id, str(m["id"]), None
+    return None, None, (
+        f"no recent message in channel {channel_id} contains "
+        f"'Recording ID: {craig_id}'. Note Craig uses Discord Components V2 "
+        f"(flags=32800) — text lives in components[].content, not embeds."
+    )
+
+
+def extract_message_text(msg: dict) -> str:
+    """Concatenate all text-bearing fields of a Discord message object.
+
+    Covers: top-level `content`, classic `embeds[].title/description/fields`,
+    AND Components V2 `components[].content` recursively (Craig's recording
+    panel uses Components V2 — `flags & 32768`, IS_COMPONENTS_V2 — and the
+    panel text lives inside nested TextDisplay blocks at
+    `components[].components[].content`, NOT in `.content` or `.embeds`).
+    """
+    parts: list[str] = [msg.get("content") or ""]
+    for em in msg.get("embeds") or []:
+        for f in ("title", "description"):
+            v = em.get(f)
+            if v:
+                parts.append(v)
+        for fld in em.get("fields") or []:
+            v = fld.get("value")
+            if v:
+                parts.append(v)
+
+    def walk(node):
+        if isinstance(node, dict):
+            v = node.get("content")
+            if isinstance(v, str) and v:
+                parts.append(v)
+            for child in node.get("components") or []:
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(msg.get("components") or [])
+    return "\n".join(parts)
 
 # Markers that strongly suggest the message is a Craig recording panel
 # even if our `Recording ID:` regex fails to match (e.g. Craig changed
@@ -99,14 +213,6 @@ def looks_like_craig(body: str) -> bool:
 
 def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False))
-
-
-def read_message(args: argparse.Namespace) -> str:
-    if args.message is not None:
-        return args.message
-    if args.message_file:
-        return pathlib.Path(args.message_file).read_text(encoding="utf-8", errors="replace")
-    return sys.stdin.read()
 
 
 def invoke_scan(craig_id: str) -> tuple[int, dict, list[dict]]:
@@ -162,33 +268,44 @@ def write_pending(craig_id: str, channel_id: str, message_id: str) -> tuple[path
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument("--message", help="Raw Craig message body (string).")
-    g.add_argument("--message-file", help="Path to a file containing the Craig message body.")
-    ap.add_argument("--channel-id", help="Discord channel ID where the Craig message lives (required unless body shows 'Recording ended.').")
-    ap.add_argument("--message-id", help="Discord message ID of the Craig panel (required unless body shows 'Recording ended.').")
-    args = ap.parse_args()
+    # Intentionally NO CLI args. The LLM was observed repeatedly:
+    #   - inventing values for --message-id / --channel-id
+    #   - feeding a stale body (with a craig_id from a previous test)
+    #     via --message, then arguing 'security scan blocks me' when
+    #     shell-escaping the zero-width chars failed
+    #   - choosing the body-passing path even when SKILL.md said not to.
+    # Removing the args entirely makes the wrong path unreachable.
+    ap = argparse.ArgumentParser(
+        description="Pull the latest Craig recording panel from "
+                    "$CRAIG_EVENTS_CHANNEL_ID and write a pending entry. "
+                    "Takes no arguments — invoke as a bare script.",
+    )
+    ap.parse_args()
 
-    message = read_message(args)
+    panel, err = find_latest_craig_panel()
+    if err or not panel:
+        emit({"status": "error", "reason": "discord-discovery-failed",
+              "detail": err or "no Craig panel found"})
+        return 1
+
+    message = extract_message_text(panel)
     if not message.strip():
-        emit({"status": "error", "reason": "empty-message",
-              "detail": "no message body provided (use --message, --message-file, or stdin)"})
-        return 2
+        emit({"status": "error", "reason": "empty-craig-panel",
+              "detail": "Craig's latest message in #craig-events has no "
+                        "extractable text (Components V2 walk returned empty). "
+                        "Check Message Content Intent + bot Read Message History."})
+        return 1
 
     m = RECORDING_ID_RE.search(message)
     if not m:
         snippet = message.strip().replace("\n", " ")[:200]
-        if looks_like_craig(message):
-            # Loud: parser is stale, operator must check Craig's format.
-            emit({"status": "error", "reason": "format-mismatch",
-                  "detail": "message has Craig markers but Recording ID regex failed — Craig format may have changed: "
-                            + snippet})
-            return 1
-        # Quiet: not a Craig panel at all.
-        emit({"status": "error", "reason": "no-recording-id", "detail": snippet})
-        return 2
+        emit({"status": "error", "reason": "format-mismatch",
+              "detail": "Craig's latest panel has no Recording ID — format may have changed: "
+                        + snippet})
+        return 1
     craig_id = m.group(1)
+    channel_id = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
+    message_id = str(panel["id"])
 
     if ENDED_RE.search(message):
         # Already ended: skip the pending dance, transcribe now.
@@ -199,20 +316,7 @@ def main() -> int:
         emit(payload)
         return rc
 
-    # Recording in progress -> hand off to craig-watch via pending state.
-    if not args.channel_id or not args.message_id:
-        emit({"status": "error", "reason": "missing-discord-ids",
-              "detail": "in-progress recordings require --channel-id and --message-id so craig-watch can refetch the panel",
-              "craig_id": craig_id})
-        return 2
-
-    if not re.fullmatch(r"[0-9]+", args.channel_id) or not re.fullmatch(r"[0-9]+", args.message_id):
-        emit({"status": "error", "reason": "bad-discord-ids",
-              "detail": "channel-id and message-id must be numeric Discord snowflakes",
-              "craig_id": craig_id})
-        return 2
-
-    state_path, is_new = write_pending(craig_id, args.channel_id, args.message_id)
+    state_path, is_new = write_pending(craig_id, channel_id, message_id)
     emit({
         "status": "pending" if is_new else "already-pending",
         "craig_id": craig_id,
