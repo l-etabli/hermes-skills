@@ -77,7 +77,14 @@ SKILLS_ROOT = pathlib.Path(
 )
 SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
 
-RECORDING_ID_RE = re.compile(r"Recording\s+ID\s*:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+RECORDING_ID_RE = re.compile(
+    # Craig in Components V2 writes `**Recording ID:** \`<id>\``, so we
+    # have to skip past stray markdown wrappers (** for bold, backticks
+    # for code) on either side of the literal `Recording ID:` and again
+    # before the id token. Whitespace + those two characters only.
+    r"Recording[\s*]*ID[\s*]*:[\s*`]*([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
 ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
 
 DISCORD_API = "https://discord.com/api/v10"

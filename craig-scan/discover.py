@@ -70,7 +70,12 @@ DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
 
 DISCORD_API = "https://discord.com/api/v10"
-RECORDING_ID_RE = re.compile(r"Recording\s+ID\s*:\s*([A-Za-z0-9_-]+)", re.IGNORECASE)
+RECORDING_ID_RE = re.compile(
+    # Craig Components V2 writes `**Recording ID:** \`<id>\``: skip past
+    # bold/code wrappers (** and backticks) before the id.
+    r"Recording[\s*]*ID[\s*]*:[\s*`]*([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
 ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
 STARTED_RE = re.compile(r"Started\s*:\s*([0-9:]+)", re.IGNORECASE)
 CHANNEL_NAME_RE = re.compile(
