@@ -83,21 +83,13 @@ ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
 DISCORD_API = "https://discord.com/api/v10"
 
 
-def discover_message_via_api(craig_id: str) -> tuple[str | None, str | None, str | None]:
-    """Find the Discord message that announced this craig_id by listing
-    the recent messages of #craig-events and matching on `Recording ID:
-    <craig_id>` in the body (content + embeds). Used when the LLM didn't
-    provide --channel-id / --message-id (it tends to hallucinate them).
-
-    Returns (channel_id, message_id, error). On success, error is None.
-    """
+def fetch_recent_messages() -> tuple[list[dict], str | None]:
+    """List the most recent messages of #craig-events. Returns (msgs, err)."""
     token = os.environ.get("DISCORD_BOT_TOKEN")
     channel_id = os.environ.get("CRAIG_EVENTS_CHANNEL_ID")
     if not token or not channel_id:
-        return None, None, "missing DISCORD_BOT_TOKEN or CRAIG_EVENTS_CHANNEL_ID env"
+        return [], "missing DISCORD_BOT_TOKEN or CRAIG_EVENTS_CHANNEL_ID env"
 
-    # urllib only — listener.py doesn't otherwise import requests, and we
-    # want this self-discovery to work without uv-with-requests gymnastics.
     import urllib.request
     import urllib.error
 
@@ -112,20 +104,48 @@ def discover_message_via_api(craig_id: str) -> tuple[str | None, str | None, str
     })
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            messages = json.load(r)
+            return json.load(r), None
     except urllib.error.HTTPError as e:
-        return None, None, f"discord-{e.code}: {e.read()[:200].decode(errors='replace')}"
+        return [], f"discord-{e.code}: {e.read()[:200].decode(errors='replace')}"
     except Exception as e:
-        return None, None, f"network: {type(e).__name__}: {e}"
+        return [], f"network: {type(e).__name__}: {e}"
 
-    # Lower-case match accommodates Craig's bold formatting `**Recording ID:**`
-    # which doesn't change the text content but the regex needle is plain.
-    # Match on the bare 'recording id: <id>' substring (post-lowercase).
+
+# Craig's well-known bot user ID. We use this to filter the channel
+# listing for *Craig's* most recent panel rather than picking up replies
+# from humans / other bots / Hermes itself.
+CRAIG_BOT_USER_ID = "272937604339466240"
+
+
+def find_latest_craig_panel() -> tuple[dict | None, str | None]:
+    """Pull the most recent message authored by Craig in #craig-events.
+    Returns (message, err). Used by the no-arg invocation path: instead
+    of trusting the LLM to pass a body or IDs, we go straight to the
+    source of truth on Discord."""
+    msgs, err = fetch_recent_messages()
+    if err:
+        return None, err
+    for m in msgs:
+        author = m.get("author") or {}
+        if str(author.get("id") or "") == CRAIG_BOT_USER_ID:
+            return m, None
+    return None, f"no recent Craig message (author.id={CRAIG_BOT_USER_ID}) in #craig-events"
+
+
+def discover_message_via_api(craig_id: str) -> tuple[str | None, str | None, str | None]:
+    """Find the Discord message that announced this craig_id by listing
+    the recent messages of #craig-events and matching on `Recording ID:
+    <craig_id>` in the body (content + embeds + components V2). Used as
+    a fallback when an explicit craig_id was passed by the caller (e.g.
+    a manual debug run)."""
+    channel_id = os.environ.get("CRAIG_EVENTS_CHANNEL_ID")
+    msgs, err = fetch_recent_messages()
+    if err:
+        return None, None, err
     needle_lower = f"recording id: {craig_id}".lower()
-    for m in messages:
+    for m in msgs:
         if needle_lower in extract_message_text(m).lower():
             return channel_id, str(m["id"]), None
-
     return None, None, (
         f"no recent message in channel {channel_id} contains "
         f"'Recording ID: {craig_id}'. Note Craig uses Discord Components V2 "
@@ -257,10 +277,34 @@ def main() -> int:
     ap.add_argument("--message-id", help="Discord message ID of the Craig panel (required unless body shows 'Recording ended.').")
     args = ap.parse_args()
 
-    message = read_message(args)
+    # Source the body for ID extraction. Two paths:
+    #   1. body provided via --message / --message-file / stdin (legacy /
+    #      explicit). We extract craig_id by regex AND need to know the
+    #      Discord message_id later (-> self-discovery via the body's
+    #      Recording ID: substring).
+    #   2. nothing on stdin / no --message-file — pull the most recent
+    #      Craig panel directly from Discord and read everything from
+    #      there. This is the *recommended* mode because it bypasses the
+    #      LLM entirely (the LLM has been observed hallucinating both
+    #      the body AND the Recording ID, so trusting it as the source
+    #      of truth is unsafe).
+    explicit_body = args.message is not None or args.message_file is not None or not sys.stdin.isatty()
+    message = read_message(args) if explicit_body else ""
+
+    direct_panel: dict | None = None
+    if not explicit_body:
+        direct_panel, err = find_latest_craig_panel()
+        if err or not direct_panel:
+            emit({"status": "error", "reason": "discord-discovery-failed",
+                  "detail": err or "no Craig panel found"})
+            return 1
+        message = extract_message_text(direct_panel)
+
     if not message.strip():
         emit({"status": "error", "reason": "empty-message",
-              "detail": "no message body provided (use --message, --message-file, or stdin)"})
+              "detail": "no message body provided (use --message, --message-file, "
+                        "or run with no body args to pull the latest Craig panel "
+                        "from #craig-events directly)"})
         return 2
 
     m = RECORDING_ID_RE.search(message)
@@ -288,30 +332,28 @@ def main() -> int:
 
     # Recording in progress -> hand off to craig-watch via pending state.
     # Source the channel_id / message_id with the following priority:
-    #   1. CLI args, when both are provided AND both look like real
-    #      Discord snowflakes (the LLM tends to hallucinate them, so we
-    #      gate aggressively).
-    #   2. Self-discovery via Discord REST API: look up the message by
-    #      `Recording ID: <craig_id>` in the recent #craig-events list.
-    # The CLI overrides exist mostly as an escape hatch for manual runs.
-    channel_id, message_id = args.channel_id, args.message_id
-
-    use_self_discovery = False
-    if not channel_id or not message_id:
-        use_self_discovery = True
-    elif not re.fullmatch(r"[0-9]+", channel_id) or not re.fullmatch(r"[0-9]+", message_id):
-        # Non-numeric -> not snowflakes, fall back.
-        use_self_discovery = True
-    elif channel_id == message_id:
-        # LLM passed the same value twice — classic hallucination.
-        use_self_discovery = True
-
-    if use_self_discovery:
-        channel_id, message_id, err = discover_message_via_api(craig_id)
-        if err:
-            emit({"status": "error", "reason": "discord-discovery-failed",
-                  "detail": err, "craig_id": craig_id})
-            return 1
+    #   1. direct_panel (from no-arg path) — already authoritative, use it.
+    #   2. CLI args, only if both look like distinct numeric snowflakes.
+    #   3. Self-discovery by craig_id substring match across recent msgs
+    #      (used when the user passed an explicit body that we trust to
+    #      contain a real ID).
+    if direct_panel is not None:
+        channel_id = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
+        message_id = str(direct_panel["id"])
+    else:
+        channel_id, message_id = args.channel_id, args.message_id
+        use_self_discovery = (
+            not channel_id or not message_id
+            or not re.fullmatch(r"[0-9]+", channel_id)
+            or not re.fullmatch(r"[0-9]+", message_id)
+            or channel_id == message_id
+        )
+        if use_self_discovery:
+            channel_id, message_id, err = discover_message_via_api(craig_id)
+            if err:
+                emit({"status": "error", "reason": "discord-discovery-failed",
+                      "detail": err, "craig_id": craig_id})
+                return 1
 
     state_path, is_new = write_pending(craig_id, channel_id, message_id)
     emit({

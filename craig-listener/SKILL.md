@@ -95,31 +95,23 @@ Réagis ⏳ au message Craig pour signaler que tu as bien capté.
 
 Le script fait l'extraction regex + l'écriture pending. **Ne fais PAS l'extraction toi-même** — la logique critique vit dans le script (le LLM ignore parfois les instructions explicites du SKILL.md).
 
-Tu n'as **PAS** besoin de connaître ni de passer le `channel_id` ou le `message_id` — le script les découvre lui-même via l'API Discord (`GET /channels/$CRAIG_EVENTS_CHANNEL_ID/messages?limit=25` puis match sur `Recording ID: <id>` dans le body). Passe juste le body Craig via `--message-file`.
+**Tu n'as RIEN à passer au script.** Lance-le sans aucun arg — il va chercher le dernier message de Craig dans `#craig-events` directement via l'API Discord (using `CRAIG_EVENTS_CHANNEL_ID` + `DISCORD_BOT_TOKEN` env), parse le format Components V2, extrait le Recording ID, et écrit le pending. Pas besoin de copier-coller le body, pas besoin d'IDs.
 
 ```python
-# 1) Écris le body Craig dans un tmpfile (PAS via shell — Craig embed des
-#    zero-width chars U+200B que le scanner sécurité Hermes flag si on les
-#    met sur la cmdline `sh -c` ou `printf %q`).
-from pathlib import Path
-Path("/tmp/craig-msg.txt").write_text(craig_message_body, encoding="utf-8")
-
-# 2) Invoke listener.py avec --message-file uniquement.
 import subprocess
 r = subprocess.run([
-    "uv", "run",
-    "--with", "google-auth",
-    "--with", "google-api-python-client",
-    "--with", "requests",
     "/opt/data/skills-shared/craig-listener/listener.py",
-    "--message-file", "/tmp/craig-msg.txt",
-], capture_output=True, text=True)
+], capture_output=True, text=True, stdin=subprocess.DEVNULL)
 print(r.stdout)
 ```
 
-**Ne PAS utiliser `printf '%s' "<body>" | ...` ni `sh -c`** : le scanner sécurité bloque (zero-width chars dans le body Craig).
+(`stdin=subprocess.DEVNULL` est important — sans ça le script attend du stdin et timeout.)
 
-`--channel-id` et `--message-id` existent comme escape hatch pour des runs manuels (debug, replay), mais en mode normal **ne les passe pas** — le LLM tend à les inventer, et le script discovery est plus fiable.
+**Pourquoi pas via body** : on a observé empiriquement que le LLM hallucine systématiquement le Recording ID quand on lui demande de le copier (cache un ID stale d'un test précédent, invente un faux). La source de vérité est Discord, pas le contexte LLM. Le script n'a donc plus besoin du LLM pour quoi que ce soit d'autre que "lance-moi quand tu vois un msg Craig".
+
+**Escape hatches** (debug uniquement, pas en mode normal) :
+- `--message-file <path>` : passe un body explicite (regex-extracted, puis self-discovery par Recording ID match).
+- `--channel-id <id> --message-id <id>` : skip discovery entièrement (rare).
 
 Le script :
 1. Extrait `Recording ID: <id>` via regex.
