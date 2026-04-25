@@ -219,8 +219,10 @@ def main() -> int:
         # rather than write a doomed pending entry.
         emit({"status": "error", "reason": "channel-equals-message",
               "detail": "--channel-id and --message-id must be different snowflakes "
-                        "(channel-id is the #craig-events channel, message-id is the Craig panel msg). "
-                        "You almost certainly passed message.id for both — re-read the source message context.",
+                        "(channel-id = the channel where Craig posted, "
+                        "message-id = the Craig panel message itself). "
+                        "You almost certainly passed message.id for both — "
+                        "re-read the source message context and try again.",
               "craig_id": craig_id})
         return 2
 
