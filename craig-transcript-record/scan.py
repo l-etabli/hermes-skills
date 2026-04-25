@@ -26,7 +26,19 @@ recording is yours to transcribe.
 Idempotent: a Drive file's `id` is recorded in the raw frontmatter and
 re-runs are skipped silently.
 
-Output (stdout, single JSON object):
+Output (stdout, one JSON object per line):
+  Zero or more progress lines (only on the long path — Drive poll +
+  transcription) describing the current phase, useful for end-user
+  visibility (a Discord status message edited live by the LLM):
+
+    {"status": "progress", "phase": "drive-poll-start"}
+    {"status": "progress", "phase": "zip-found", "name": "...", "size_bytes": N}
+    {"status": "progress", "phase": "groq-start"}
+    {"status": "progress", "phase": "writing-raw"}
+
+  Followed by a single canonical result line (always the LAST line of
+  stdout — callers MUST parse the last line as the result):
+
   {
     "status": "processed",
     "path":   "raw/transcripts/2026-04-25-craig-xxx.md",
@@ -295,7 +307,12 @@ def write_transcript(f: dict, tx: dict, speakers: list[str], craig_id: str) -> p
 
 
 def emit(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=False))
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def emit_progress(phase: str, **kwargs) -> None:
+    payload = {"status": "progress", "phase": phase, **kwargs}
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def main() -> int:
@@ -320,11 +337,18 @@ def main() -> int:
     )
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
+    emit_progress("drive-poll-start")
     f = poll_for_zip(drive, craig_id)
     if not f:
         emit({"status": "error", "reason": "drive-poll-timeout",
               "detail": f"no craig_{craig_id}_*.flac.zip in folder after {POLL_TIMEOUT_S//60}min"})
         return 1
+
+    try:
+        size_bytes = int(f.get("size") or 0)
+    except (TypeError, ValueError):
+        size_bytes = 0
+    emit_progress("zip-found", name=f["name"], size_bytes=size_bytes)
 
     existing = find_existing_transcript(drive_id=f["id"])
     if existing:
@@ -337,11 +361,13 @@ def main() -> int:
             zip_path = tmpdir / f["name"]
             download_to(drive, f["id"], zip_path)
             audio, speakers = extract_and_mix(zip_path, tmpdir)
+            emit_progress("groq-start")
             tx = transcribe_groq(audio)
             if not tx.get("segments"):
                 emit({"status": "error", "reason": "empty-transcription",
                       "detail": "Groq returned 0 segments (silence?)"})
                 return 1
+            emit_progress("writing-raw")
             out = write_transcript(f, tx, speakers, craig_id)
             if out is None:
                 emit({"status": "skipped", "reason": "race-already-written"})

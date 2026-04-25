@@ -42,9 +42,9 @@ Plus REQUIRED for pending state:
 Output (single JSON object on stdout):
   {"status": "pending",        "craig_id": "...", "state_path": ".craig-pending/<id>.json"}
   {"status": "already-pending", "craig_id": "...", "state_path": ".craig-pending/<id>.json"}
-  {"status": "processed", "craig_id": "...", "path": "...", ...}      # passed-through from scan.py
-  {"status": "skipped",   "craig_id": "...", "reason": "...", ...}
-  {"status": "error",     "craig_id": "...", "reason": "...", "detail": "..."}
+  {"status": "processed", "craig_id": "...", "path": "...", "progress": [...], ...}  # passed-through from scan.py
+  {"status": "skipped",   "craig_id": "...", "reason": "...", "progress": [...]?, ...}
+  {"status": "error",     "craig_id": "...", "reason": "...", "detail": "...", "progress": [...]?}
   {"status": "error",     "reason": "no-recording-id|empty-message|...", "detail": "..."}
 
 Exit codes: 0 for pending/processed/skipped, 1 for runtime errors,
@@ -109,10 +109,14 @@ def read_message(args: argparse.Namespace) -> str:
     return sys.stdin.read()
 
 
-def invoke_scan(craig_id: str) -> tuple[int, dict]:
+def invoke_scan(craig_id: str) -> tuple[int, dict, list[dict]]:
+    """Run scan.py and parse its multi-line JSON stdout. Returns
+    (returncode, canonical_result, progress_entries) — the progress
+    list mirrors what scan.py emitted in order, so the LLM can replay
+    the phases on a Discord status message."""
     if not SCAN_PY.exists():
         return 1, {"status": "error", "reason": "scan-py-missing",
-                   "detail": f"{SCAN_PY} not found (HERMES_SKILLS_DIR misconfigured?)"}
+                   "detail": f"{SCAN_PY} not found (HERMES_SKILLS_DIR misconfigured?)"}, []
     cmd = [
         "uv", "run",
         "--with", "google-auth",
@@ -122,12 +126,22 @@ def invoke_scan(craig_id: str) -> tuple[int, dict]:
         "--craig-id", craig_id,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    last = (proc.stdout.strip().splitlines() or [""])[-1]
-    try:
-        return proc.returncode, json.loads(last) if last else {}
-    except json.JSONDecodeError:
+    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    progress: list[dict] = []
+    result: dict | None = None
+    for ln in lines:
+        try:
+            obj = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("status") == "progress":
+            progress.append(obj)
+        else:
+            result = obj
+    if result is None:
         return 1, {"status": "error", "reason": "scan-py-bad-json",
-                   "detail": (proc.stdout + proc.stderr)[-500:]}
+                   "detail": (proc.stdout + proc.stderr)[-500:]}, progress
+    return proc.returncode, result, progress
 
 
 def write_pending(craig_id: str, channel_id: str, message_id: str) -> tuple[pathlib.Path, bool]:
@@ -178,8 +192,10 @@ def main() -> int:
 
     if ENDED_RE.search(message):
         # Already ended: skip the pending dance, transcribe now.
-        rc, payload = invoke_scan(craig_id)
+        rc, payload, progress = invoke_scan(craig_id)
         payload["craig_id"] = craig_id
+        if progress:
+            payload["progress"] = progress
         emit(payload)
         return rc
 

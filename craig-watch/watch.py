@@ -29,12 +29,17 @@ Optional env: HERMES_SKILLS_DIR (default /opt/data/skills-shared),
 Output (single JSON object on stdout):
   {
     "checked":   N,
-    "processed": [{"craig_id": "...", "path": "...", ...}, ...],
-    "skipped":   [{"craig_id": "...", "reason": "..."}, ...],
+    "processed": [{"craig_id": "...", "path": "...", "progress": [...], ...}, ...],
+    "skipped":   [{"craig_id": "...", "reason": "...", "progress": [...]}, ...],
     "still_pending": [{"craig_id": "...", "first_seen_at": "..."}, ...],
     "expired":   [{"craig_id": "...", "first_seen_at": "...", "age_hours": N}, ...],
-    "errors":    [{"craig_id": "...", "stage": "discord-fetch|scan-py|...", "detail": "..."}, ...]
+    "errors":    [{"craig_id": "...", "stage": "discord-fetch|scan-py|...", "detail": "...", "progress": [...]?}, ...]
   }
+
+  Each `progress` list (when present) is the ordered trail of phase
+  markers emitted by scan.py: drive-poll-start → zip-found → groq-start
+  → writing-raw. The LLM uses these to keep a live Discord status
+  message in sync with reality.
 
 Exit code: 0 always (a cron run shouldn't fail noisily; per-entry errors
 go in the errors[] field).
@@ -121,10 +126,18 @@ def message_body(msg: dict) -> str:
     return "\n".join(parts)
 
 
-def invoke_scan(craig_id: str) -> tuple[int, dict]:
+def invoke_scan(craig_id: str) -> tuple[int, dict, list[dict]]:
+    """Run scan.py and parse its multi-line JSON stdout.
+
+    scan.py emits zero or more `{"status": "progress", "phase": ...}`
+    lines followed by a single canonical result line. We return the
+    result as the second element, and the list of progress entries
+    (in emission order) as the third — callers can surface them as a
+    live UX trail (e.g. edit a Discord status message).
+    """
     if not SCAN_PY.exists():
         return 1, {"status": "error", "reason": "scan-py-missing",
-                   "detail": f"{SCAN_PY} not found"}
+                   "detail": f"{SCAN_PY} not found"}, []
     cmd = [
         "uv", "run",
         "--with", "google-auth",
@@ -134,12 +147,22 @@ def invoke_scan(craig_id: str) -> tuple[int, dict]:
         "--craig-id", craig_id,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    last = (proc.stdout.strip().splitlines() or [""])[-1]
-    try:
-        return proc.returncode, json.loads(last) if last else {}
-    except json.JSONDecodeError:
+    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    progress: list[dict] = []
+    result: dict | None = None
+    for ln in lines:
+        try:
+            obj = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("status") == "progress":
+            progress.append(obj)
+        else:
+            result = obj
+    if result is None:
         return 1, {"status": "error", "reason": "scan-py-bad-json",
-                   "detail": (proc.stdout + proc.stderr)[-500:]}
+                   "detail": (proc.stdout + proc.stderr)[-500:]}, progress
+    return proc.returncode, result, progress
 
 
 def age_hours(iso: str) -> float:
@@ -206,8 +229,10 @@ def main() -> int:
                                             "first_seen_at": first_seen_at})
             continue
 
-        rc, payload = invoke_scan(craig_id)
+        rc, payload, progress = invoke_scan(craig_id)
         payload["craig_id"] = craig_id
+        if progress:
+            payload["progress"] = progress
         status = payload.get("status")
         if status == "processed":
             result["processed"].append(payload)
@@ -217,8 +242,11 @@ def main() -> int:
             entry_path.unlink(missing_ok=True)
         else:
             # Error: keep the pending entry so the next tick retries.
-            result["errors"].append({"craig_id": craig_id, "stage": "scan-py",
-                                     "detail": payload.get("detail") or payload.get("reason") or "unknown"})
+            err = {"craig_id": craig_id, "stage": "scan-py",
+                   "detail": payload.get("detail") or payload.get("reason") or "unknown"}
+            if progress:
+                err["progress"] = progress
+            result["errors"].append(err)
 
     emit(result)
     return 0

@@ -74,13 +74,47 @@ Le script :
 ```json
 {
   "checked": N,
-  "processed": [{"craig_id": "...", "path": "raw/transcripts/...", "drive_id": "...", "name": "..."}, ...],
-  "skipped":   [{"craig_id": "...", "reason": "..."}, ...],
+  "processed": [{"craig_id": "...", "path": "raw/transcripts/...", "drive_id": "...", "name": "...", "progress": [...]}, ...],
+  "skipped":   [{"craig_id": "...", "reason": "...", "progress": [...]?}, ...],
   "still_pending": [{"craig_id": "...", "first_seen_at": "..."}, ...],
   "expired":   [{"craig_id": "...", "first_seen_at": "...", "age_hours": N}, ...],
-  "errors":    [{"craig_id": "...", "stage": "discord-fetch|scan-py|...", "detail": "..."}, ...]
+  "errors":    [{"craig_id": "...", "stage": "discord-fetch|scan-py|...", "detail": "...", "progress": [...]?}, ...]
 }
 ```
+
+Le champ `progress` (présent quand `scan.py` a tourné) est une liste ordonnée des phases franchies :
+
+```json
+[
+  {"status": "progress", "phase": "drive-poll-start"},
+  {"status": "progress", "phase": "zip-found", "name": "...", "size_bytes": 12345678},
+  {"status": "progress", "phase": "groq-start"},
+  {"status": "progress", "phase": "writing-raw"}
+]
+```
+
+Tu t'en sers pour rédiger une UX live côté Discord (cf. step 2.5 ci-dessous).
+
+### 2.5. UX Discord : ÉDITER un message de status, pas en spammer N
+
+Entre le moment où Craig pose `Recording ended.` et la notif finale ✅, il s'écoule 1-15 min (Drive cook + upload + Groq). L'utilisateur DOIT savoir où on en est sans recevoir 4 messages distincts.
+
+**Règle absolue** : **un seul** message Discord par recording, **édité** à chaque transition. Jamais N nouveaux messages.
+
+| Phase | Action LLM Discord |
+|---|---|
+| craig-watch détecte `Recording ended.` (avant `invoke_scan`) — vu via le passage de `still_pending[]` à `processed[]` entre deux ticks | Poste **un nouveau message** dans le canal d'origine du panel Craig (pas `#craig-events` — le canal dans lequel le user a parlé du recording, ou `DISCORD_HOME_CHANNEL` à défaut) : « 🎙️ Recording terminé (`craig_id`), je récupère le zip Drive… ». **Mémorise son `message_id`** dans le contexte de ce run. |
+| `progress[i].phase == "zip-found"` | **Édite** ce message : « 📥 Zip trouvé (`<size_bytes>` → format MB), transcription Groq en cours… ». |
+| `progress[i].phase == "groq-start"` | (optionnel — peut sauter, la phase précédente est encore lisible.) |
+| `progress[i].phase == "writing-raw"` | (optionnel.) |
+| Résultat `processed` | **Édite** : « ✅ Transcript intégré : `<filename>` — N pages wiki updatées : [[a]], [[b]] ». |
+| Résultat `error` / `expired` / `drive-poll-timeout` | **Édite** avec ⚠️ + `reason` + `detail`. |
+
+**Persistance du `message_id` entre ticks cron** : approche v1 = mémoire LLM dans le contexte du run en cours. C'est suffisant pour le cas standard où la chaîne complète (zip-found → processed) tient en un ou deux ticks de 5 min. **Limite connue** : si la chaîne s'étale sur plusieurs ticks (Drive lent + Groq lent), chaque tick redémarre avec un contexte vide → tu perds l'ID du message à éditer. v2 (à implémenter si on rencontre le cas) : stocker `discord_status_message_id` dans le pending JSON au moment du premier post.
+
+**Ne pose PAS de status message si** :
+- `result["processed"]`, `result["skipped"]`, `result["errors"]` sont tous vides ou ne concernent que des entrées du tick courant pour lesquelles tu n'as encore rien posté → silence (le user n'attend rien, ou alors on est dans un tick "rien à signaler").
+- Le résultat est `skipped` avec `reason: already-transcribed` ET tu n'as pas encore posté de status pour ce craig_id → silence (déjà transcrit avant, pas de bruit).
 
 ### 3. Pour chaque entrée de `processed[]` : commit + push + ingest
 
@@ -96,13 +130,8 @@ Puis active le skill `llm-wiki` et applique son opération `ingest` sur le fichi
 
 ### 4. Notification finale
 
-- Si `processed` non vide : poste dans le `DISCORD_HOME_CHANNEL` (ou autre channel selon convention de l'instance) un récap court :
-  ```
-  ✅ <N> recording(s) Craig transcrits :
-     - [[2026-04-25-craig-xxx]] (3 pages wiki)
-     - [[2026-04-25-craig-yyy]] (1 page wiki)
-  ```
-- Si seulement `still_pending` ou `skipped` : silence (cron, pas de bruit inutile).
+- Si `processed` non vide : la notif principale est l'**édition** du message de status (cf. step 2.5) avec le ✅ final, contenant filename + pages wiki updatées. Pas de récap séparé dans `DISCORD_HOME_CHANNEL` — le user lit le status message édité et c'est tout.
+- Si `still_pending` ou `skipped` (sans status message déjà posé) : silence (cron, pas de bruit inutile).
 - Si `expired` non vide : notifie ⚠️ avec les IDs expirés (utilisateur peut décider de relancer manuellement via `craig-scan` si le zip est quand même arrivé sur Drive).
 - Si `errors` non vide : applique la **politique de dedup ci-dessous** avant de notifier — sinon une erreur persistante (Drive sharing cassé, Groq down) générera 288 notifications sur 24h.
 

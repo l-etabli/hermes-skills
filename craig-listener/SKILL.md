@@ -124,12 +124,36 @@ Le script :
 
 - **`pending`** → silence côté Discord (la réaction ⏳ posée au step 1 reste). craig-watch s'occupera de la suite.
 - **`already-pending`** → l'event Discord a été reçu deux fois (rare, mais possible : reconnect bot, replay). Ne pose PAS une nouvelle réaction ⏳, ne renotifie pas. Le pending d'origine est toujours en vol.
-- **`processed`** → suis la procédure de `craig-transcript-record` à partir du step 3 (commit + push) puis step 4 (ingest llm-wiki). Notification ✅.
+- **`processed`** → la sortie contient un champ `progress[]` avec les phases qu'a franchies `scan.py`. Suis la **UX live** ci-dessous (path direct : pas de pending, donc l'utilisateur découvre la chaîne en un seul passage). Puis suis la procédure `craig-transcript-record` à partir du step 3 (commit + push) puis step 4 (ingest llm-wiki). Notification ✅.
 - **`skipped` / `already-transcribed`** → réagis ✅ pour confirmer qu'on est au courant.
 - **`error` / `no-recording-id`** → ce n'était pas un message Craig de recording. Retire la réaction ⏳, ignore silencieusement.
 - **`error` / `format-mismatch`** → ⚠️ **bruyant** : le message ressemble à un panel Craig (présence de `🔴 Recording`, `Voice Region:`, etc.) mais la regex `Recording ID:` a échoué. Très probablement le format Craig a changé. Notifie l'utilisateur avec le snippet, pour qu'on puisse mettre à jour la regex. Ne plus jamais ignorer silencieusement ce cas — sinon on arrête de transcrire sans s'en rendre compte.
 - **`error` / `missing-discord-ids` / `bad-discord-ids`** → tu as oublié de passer `--channel-id` ou `--message-id`. Re-tente avec les bons paramètres.
 - **`error` / autres** → notifie ⚠️ avec `reason` + `detail`.
+
+## UX live (path `processed` direct, recording déjà terminé)
+
+Quand l'event arrive APRÈS la fin du recording (Hermes a vu le panel en mode `Recording ended.` d'emblée), le listener invoque `scan.py` directement et la chaîne complète (Drive poll → Groq → write) tient en un seul run LLM. La sortie agrège un champ `progress[]` :
+
+```json
+[
+  {"status": "progress", "phase": "drive-poll-start"},
+  {"status": "progress", "phase": "zip-found", "name": "...", "size_bytes": 12345678},
+  {"status": "progress", "phase": "groq-start"},
+  {"status": "progress", "phase": "writing-raw"}
+]
+```
+
+Comme `scan.py` a tourné synchronement, ces phases sont déjà toutes passées au moment où tu lis le résultat. Tu n'as donc **pas** à éditer un message en live (le recording étant déjà terminé, le user n'attend pas en temps réel). **Une seule notif finale** :
+
+- `processed` → poste dans le canal d'origine du panel Craig (ou `DISCORD_HOME_CHANNEL`) :
+  ```
+  ✅ Recording <craig_id> transcrit (chaîne directe, recording déjà terminé) :
+  📄 <filename> — N pages wiki updatées : [[a]], [[b]]
+  ```
+  Le `progress[]` n'est utile ici que pour le debug — pas besoin de l'afficher au user, mais inclus-le si tu détectes un timing anormal (`zip-found` avec une grosse taille = recording long).
+
+- `error` avec `progress[]` partiel → mentionne la dernière phase atteinte dans le ⚠️ (ex. « bloqué après `zip-found`, Groq a échoué : … »). C'est diagnostiqué d'un coup d'œil.
 
 ## Pitfalls
 
