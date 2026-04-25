@@ -1,7 +1,7 @@
 ---
 name: voice-transcript
 description: "Scanne un dossier Google Drive, transcrit via Groq Whisper tout audio nouveau (zips Craig, voice notes, exports Zoom, mp3/m4a/wav/flac/ogg), dépose le résultat dans raw/transcripts/ d'un wiki llm-wiki et enchaîne l'opération ingest du skill llm-wiki. Idempotent via sha256."
-version: 1.1.0
+version: 1.2.0
 platforms: [linux]
 metadata:
   hermes:
@@ -72,12 +72,7 @@ Avant de coder quoi que ce soit, observe ces 4 règles propres à l'environnemen
 
 - **Python via `uv run`, jamais `pip`.** `pip` n'est pas dispo dans l'image upstream. Pour exécuter un script avec dépendances : `uv run --with google-auth --with google-api-python-client --with requests --with python-dotenv ./script.py`. Pour un one-liner : `uv run --with requests python -c '...'`.
 - **Workdir = `tempfile.mkdtemp()`.** N'écris jamais de script ou de fichier audio dans `/opt/data/`, `/opt/hermes/`, ou `$WIKI_PATH`. Tout dans un tmpdir, supprimé en fin de run.
-- **Auth git du wiki = via `http.extraheader` Basic.** Le remote URL de `$WIKI_PATH` est volontairement token-less. NE FAIT PAS `git remote set-url` pour y embarquer un token (ça pollue `.git/config` et le token expire en 1h). Utilise à la place :
-  ```bash
-  AUTH_HEADER=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)
-  git -C "$WIKI_PATH" -c "http.extraheader=Authorization: Basic $AUTH_HEADER" <push|pull|fetch>
-  ```
-  Bearer ne marche pas pour git HTTPS sur GitHub, seul Basic passe.
+- **Auth git = transparente.** Un credential helper est posé sur l'instance via `~/.gitconfig` (vit dans `/opt/data/home/.gitconfig`) qui lit `$GITHUB_TOKEN` à chaque op et fournit l'auth pour github.com. **Tu fais juste `git pull`, `git commit`, `git push` — sans token, sans `remote set-url`, sans header.** Tout fonctionne. NE FAIT PAS `export GITHUB_TOKEN=...` ni `git remote set-url ...@github.com/...` — ça déclenche les scanners de sécurité pour rien et ça ne sert à rien.
 - **Env vars chargées au container start.** `GROQ_API_KEY`, `AUDIO_DRIVE_FOLDER_ID`, `GITHUB_TOKEN`, etc. sont injectées via Docker `env_file:`. Tu y accèdes par `os.environ[...]`. Ne tente pas de les recharger d'un .env.
 
 ### 1. Acknowledge et oriente-toi
@@ -335,14 +330,13 @@ Pour chaque entrée de `new` :
 
 ```bash
 cd "$WIKI_PATH"
-AUTH_HEADER=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)
-git -c "http.extraheader=Authorization: Basic $AUTH_HEADER" pull --rebase
+git pull --rebase
 git add "<chemin>"
 git commit -m "raw: capture transcript $(basename '<chemin>' .md)"
-git -c "http.extraheader=Authorization: Basic $AUTH_HEADER" push
+git push
 ```
 
-Si le push échoue avec une erreur d'auth, attends 60 s (le sidecar refresh le token toutes les 45 min) et retry une fois. Au-delà, log et passe au candidat suivant — le raw est déjà committé localement, le push se rattrape au prochain run.
+L'auth est gérée par le credential helper installé côté infra (lit `$GITHUB_TOKEN` à chaque op), aucune manipulation de token n'est nécessaire. Si le push échoue avec une erreur d'auth, attends 60 s (le sidecar refresh le token toutes les 45 min) et retry une fois. Au-delà, log et passe au candidat suivant — le raw est déjà committé localement, le push se rattrape au prochain run.
 
 ### 5. Enchaîne l'ingestion (Phase B)
 
@@ -385,7 +379,7 @@ Si rien de nouveau dans Drive : message court silencieux côté Discord (ou rien
 - **Rate limit Groq (429)** : back-off 30s, retry 3 fois max, puis abandonne et passe au candidat suivant.
 - **Réseau qui drop** (Drive ou Groq) : retry 3 fois avec backoff exponentiel (30s → 60s → 120s).
 - **Mode scan automatique sans trigger user** (cron) : pas de réaction emoji ni de message Discord si rien de nouveau, pour éviter le bruit.
-- **Pas de `git remote set-url` avec token embarqué** : le remote du wiki est volontairement token-less (kb-bootstrap.sh le pose ainsi). Polluer `.git/config` avec un token expirant en 1h crée une dette de re-config à chaque rotation. Toujours utiliser `git -c http.extraheader=...` (Basic, pas Bearer — voir section "Conventions runtime").
+- **Pas de `git remote set-url` avec token embarqué, ni `export GITHUB_TOKEN=...`** : le credential helper installé côté infra fait le boulot. Ces commandes déclenchent inutilement le scanner de sécurité de Hermes (qui te demandera une approbation à chaque fois) et n'apportent rien. Fais simplement `git pull/commit/push`.
 - **Pas de `pip install`** : indispo dans l'image upstream. Toujours `uv run --with <pkg>` pour exécuter avec deps.
 - **Pas d'écriture de fichiers dans `/opt/data/`, `/opt/hermes/`** : tout dans un `tempfile.mkdtemp()` ou `mktemp -d`, supprimé en fin de run.
 
