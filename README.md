@@ -13,7 +13,7 @@ Les 3 instances Hermes (perso, piloti, telluris) tournent sur le même VPS dans 
 ```
 hermes-skills/
 ├── README.md
-├── craig-transcript/
+├── voice-transcript/
 │   ├── SKILL.md              # spec + procédure
 │   └── scripts/              # helpers (optionnel)
 └── …
@@ -91,7 +91,7 @@ Géré par [hermes-infra](https://github.com/l-etabli/hermes-infra) :
 
 | Skill | Catégorie | Status | Description |
 |---|---|---|---|
-| [`craig-transcript`](./craig-transcript/) | voice | 🚧 draft | Capture la transcription d'un enregistrement Craig (URL `craig.horse/rec/<id>?key=<key>`) dans `raw/transcripts/`, puis enchaîne `llm-wiki ingest` pour la promouvoir en pages wiki |
+| [`voice-transcript`](./voice-transcript/) | voice | 🚧 draft | Scanne un dossier Google Drive, transcrit via Groq Whisper tout audio nouveau (zips Craig, voice notes, exports Zoom, mp3/m4a/wav/flac/ogg), dépose dans `raw/transcripts/`, puis enchaîne `llm-wiki ingest` |
 
 ## Liens
 
