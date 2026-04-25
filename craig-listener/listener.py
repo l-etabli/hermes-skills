@@ -102,7 +102,14 @@ def discover_message_via_api(craig_id: str) -> tuple[str | None, str | None, str
     import urllib.error
 
     url = f"{DISCORD_API}/channels/{channel_id}/messages?limit=25"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bot {token}"})
+    # Cloudflare in front of discord.com refuses the default
+    # Python-urllib User-Agent with `error code: 1010` (browser-signature
+    # ban). Discord's API spec also REQUIRES bots to send this exact
+    # format: https://discord.com/developers/docs/reference#user-agent
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bot {token}",
+        "User-Agent": "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)",
+    })
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             messages = json.load(r)

@@ -77,6 +77,11 @@ SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
 
 MAX_AGE_HOURS = float(os.environ.get("CRAIG_WATCH_MAX_AGE_HOURS", "24"))
 DISCORD_API = "https://discord.com/api/v10"
+# Cloudflare fronting discord.com banks browser-signature filtering on
+# the User-Agent and rejects `python-requests/X.Y.Z` with `error code:
+# 1010`. Discord's spec also requires this exact format for bots:
+# https://discord.com/developers/docs/reference#user-agent
+DISCORD_USER_AGENT = "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)"
 ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
 
 
@@ -89,7 +94,10 @@ def fetch_message(channel_id: str, message_id: str) -> tuple[dict | None, str | 
     try:
         r = requests.get(
             f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}",
-            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            headers={
+                "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                "User-Agent": DISCORD_USER_AGENT,
+            },
             timeout=15,
         )
     except requests.RequestException as exc:
