@@ -51,6 +51,16 @@ from datetime import datetime, timezone
 
 import requests
 
+REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN")
+_missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
+if _missing:
+    print(json.dumps({"checked": 0, "processed": [], "skipped": [],
+                      "still_pending": [], "expired": [],
+                      "errors": [{"stage": "missing-env",
+                                  "detail": f"missing required env vars: {', '.join(_missing)}",
+                                  "missing": _missing}]}, ensure_ascii=False))
+    sys.exit(0)
+
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 PENDING_DIR = WIKI_PATH / ".craig-pending"
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]

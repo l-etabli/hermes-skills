@@ -70,6 +70,15 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+REQUIRED_ENV = ("WIKI_PATH", "GROQ_API_KEY",
+                "GOOGLE_APPLICATION_CREDENTIALS", "AUDIO_DRIVE_FOLDER_ID")
+_missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
+if _missing:
+    print(json.dumps({"status": "error", "reason": "missing-env",
+                      "detail": f"missing required env vars: {', '.join(_missing)}",
+                      "missing": _missing}, ensure_ascii=False))
+    sys.exit(2)
+
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 TRANSCRIPTS_DIR = WIKI_PATH / "raw" / "transcripts"
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]

@@ -61,6 +61,14 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+REQUIRED_ENV = ("WIKI_PATH",)
+_missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
+if _missing:
+    print(json.dumps({"status": "error", "reason": "missing-env",
+                      "detail": f"missing required env vars: {', '.join(_missing)}",
+                      "missing": _missing}, ensure_ascii=False))
+    sys.exit(2)
+
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 PENDING_DIR = WIKI_PATH / ".craig-pending"
 

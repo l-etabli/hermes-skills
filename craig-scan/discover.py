@@ -55,6 +55,14 @@ from datetime import datetime
 
 import requests
 
+REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN", "CRAIG_EVENTS_CHANNEL_ID")
+_missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
+if _missing:
+    print(json.dumps({"status": "error", "reason": "missing-env",
+                      "detail": f"missing required env vars: {', '.join(_missing)}",
+                      "missing": _missing}, ensure_ascii=False))
+    sys.exit(2)
+
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 TRANSCRIPTS_DIR = WIKI_PATH / "raw" / "transcripts"
 PENDING_DIR = WIKI_PATH / ".craig-pending"
