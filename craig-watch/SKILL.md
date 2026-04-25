@@ -31,6 +31,12 @@ required_environment_variables:
   - name: CRAIG_WATCH_MAX_AGE_HOURS
     prompt: "Âge max d'un pending avant expiration (défaut 24). Au-delà, on considère que Craig a crashé ou que le recording a été abandonné, et on drop l'entrée."
     required_for: optional
+  - name: DISCORD_HOME_CHANNEL
+    prompt: "ID du canal Discord humain où meeting-debrief poste le recap (PAS #craig-events). Hérité par meeting-debrief/debrief.py au step 5."
+    required_for: full functionality
+  - name: MEETING_DEBRIEF_MIN_DURATION_S
+    prompt: "Durée min en secondes pour qu'un recording soit débriefé (défaut 180 = 3 min). Utilisé au step 5 pour skip cheap. Hérité par meeting-debrief/debrief.py."
+    required_for: optional
 ---
 
 # Craig Watch
@@ -136,6 +142,33 @@ Puis active le skill `llm-wiki` et applique son opération `ingest` sur le fichi
 - Si `still_pending` ou `skipped` (sans status message déjà posé) : silence (cron, pas de bruit inutile).
 - Si `expired` non vide : notifie ⚠️ avec les IDs expirés (utilisateur peut décider de relancer manuellement via `craig-scan` si le zip est quand même arrivé sur Drive).
 - Si `errors` non vide : applique la **politique de dedup ci-dessous** avant de notifier — sinon une erreur persistante (Drive sharing cassé, Groq down) générera 288 notifications sur 24h.
+
+### 5. Pour chaque entrée de `processed[]` : invoque `meeting-debrief`
+
+Une fois le commit + push + ingest faits (step 3) et le status message édité ✅ (step 4), enchaîne avec un debrief humain destiné au user — le status message édité reste un log technique court ; le recap structuré (TLDR + décisions + actions à valider) part dans `DISCORD_HOME_CHANNEL` comme un message neuf, sous lequel un thread est ouvert pour valider les actions.
+
+a. **Skip cheap** : si `processed[i].duration_s` est connu et < `MEETING_DEBRIEF_MIN_DURATION_S` (défaut 180), skip — pas besoin de générer le JSON.
+
+b. **Lis** `raw/transcripts/<path>.md` (le `path` est `processed[i].path`, wiki-relatif).
+
+c. **Génère** le JSON debrief conforme à `meeting-debrief/schema.json` (cf. `meeting-debrief/SKILL.md` § Schéma).
+
+d. **Écris-le** dans `$WIKI_PATH/raw/debriefs/<date>-<slug>.json` (slug = basename du transcript sans `.md`).
+
+e. **Invoke** :
+
+   ```bash
+   uv run --with requests --with jsonschema --with pyyaml \
+       /opt/data/skills-shared/meeting-debrief/debrief.py \
+       --debrief-path raw/debriefs/<date>-<slug>.json
+   ```
+
+f. **Lis le JSON de sortie** :
+   - `posted` → silence (le recap est sur `DISCORD_HOME_CHANNEL`, séparé du status message).
+   - `skipped` (`too-short` / `already-debriefed` / `no-actions`) → silence.
+   - `error` → notifie ⚠️ avec `reason` + `detail` (ce sont des erreurs locales, pas des notifs cron-spam).
+
+Ne commit PAS `raw/debriefs/<…>.json` ici (le push est géré par le pipeline `llm-wiki ingest` au prochain tick si on veut versionner le JSON, ou ignoré sinon — au choix de hermes-infra).
 
 ### Politique de dedup d'erreurs (à appliquer côté LLM, pas côté script)
 

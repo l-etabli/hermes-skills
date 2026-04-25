@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://l-etabli.github.io/hermes-skills/meeting-debrief/schema.json",
+  "title": "MeetingDebrief",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["transcript_path", "tldr", "decisions", "open_questions", "action_items"],
+  "properties": {
+    "transcript_path": {
+      "type": "string",
+      "description": "Wiki-relative path of the transcript this debrief is derived from (e.g. raw/transcripts/2026-04-25-craig-xxx.md)."
+    },
+    "tldr": {
+      "type": "string",
+      "minLength": 1,
+      "description": "2-5 bullet-point summary of the meeting (markdown, one line per bullet)."
+    },
+    "decisions": {
+      "type": "array",
+      "description": "Concrete decisions taken during the meeting. Empty array if none.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "description": "Questions raised but not resolved. Empty array if none.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "action_items": {
+      "type": "array",
+      "description": "Actionable items proposed by the LLM, awaiting user validation in the Discord thread.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "type", "description", "suggested_action", "confidence"],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-based index, must be unique within the action_items array."
+          },
+          "type": {
+            "type": "string",
+            "enum": ["bug", "contact", "relance", "task", "decision"],
+            "description": "Semantic category of the action."
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Human-readable summary of what needs to happen."
+          },
+          "suggested_action": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "target"],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["github-issue", "hermes-cron", "gmail-draft", "obsidian-note", "linear-task"],
+                "description": "Concrete dispatch target — which downstream skill should handle this action."
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Routing target. github-issue → 'owner/repo'. hermes-cron → cron name. gmail-draft → recipient email. obsidian-note → vault-relative path. linear-task → team key."
+              },
+              "when": {
+                "type": "string",
+                "description": "Optional scheduling info. ISO date, cron expression, or natural-language ('next monday'). Required for hermes-cron."
+              },
+              "body": {
+                "type": "string",
+                "description": "Optional pre-filled body (markdown for github-issue/obsidian-note, plain text for gmail-draft)."
+              }
+            }
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "LLM self-rated confidence that this action is real and well-routed. < 0.6 → flag for closer user review."
+          }
+        }
+      }
+    }
+  }
+}
