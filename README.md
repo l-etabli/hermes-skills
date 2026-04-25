@@ -13,9 +13,18 @@ Les 3 instances Hermes (perso, piloti, telluris) tournent sur le même VPS dans 
 ```
 hermes-skills/
 ├── README.md
-├── voice-transcript/
-│   ├── SKILL.md              # spec + procédure
-│   └── scripts/              # helpers (optionnel)
+├── craig-listener/           # event-driven : msg Craig → pending state
+│   ├── SKILL.md
+│   └── listener.py
+├── craig-watch/              # cron : détecte fin de recording, lance la transcription
+│   ├── SKILL.md
+│   └── watch.py
+├── craig-scan/               # manuel : rattrapage backlog avec validation utilisateur
+│   ├── SKILL.md
+│   └── discover.py
+├── craig-transcript-record/  # primitive : --craig-id → poll Drive → Groq → raw/
+│   ├── SKILL.md
+│   └── scan.py
 └── …
 ```
 
@@ -89,9 +98,18 @@ Géré par [hermes-infra](https://github.com/l-etabli/hermes-infra) :
 
 ## Skills inclus
 
-| Skill | Catégorie | Status | Description |
+Famille **Craig** — capture event-driven des recordings vocaux Discord (Craig bot) vers la KB :
+
+| Skill | Catégorie | Trigger | Rôle |
 |---|---|---|---|
-| [`voice-transcript`](./voice-transcript/) | voice | 🚧 draft | Scanne un dossier Google Drive, transcrit via Groq Whisper tout audio nouveau (zips Craig, voice notes, exports Zoom, mp3/m4a/wav/flac/ogg), dépose dans `raw/transcripts/`, puis enchaîne `llm-wiki ingest` |
+| [`craig-listener`](./craig-listener/) | voice | Discord event | Capte le msg initial de Craig dans `#craig-events`, extrait le Recording ID, écrit un pending state dans `$WIKI_PATH/.craig-pending/` (le watcher prend le relais). Si le msg montre déjà `Recording ended.`, déclenche directement la transcription. |
+| [`craig-watch`](./craig-watch/) | voice | Cron 5 min | Refetch chaque pending via l'API Discord, détecte la transition vers `Recording ended.`, invoque `craig-transcript-record/scan.py`, supprime le pending sur succès. Expire les pending > 24h. |
+| [`craig-scan`](./craig-scan/) | voice | Manuel (utilisateur) | Liste les recordings finis dans l'historique de `#craig-events` qui n'ont jamais été transcrits ni watchés, présente la liste, **attend la sélection utilisateur**, puis transcrit séquentiellement les IDs validés. |
+| [`craig-transcript-record`](./craig-transcript-record/) | voice | `--craig-id <ID>` (appelé par les 3 ci-dessus) | Primitive de transcription : poll Drive (30→60→120s, timeout 20 min), download le zip Craig, mix ffmpeg multi-pistes, Groq Whisper, écrit `raw/transcripts/<date>-craig-<id>-…md`. Idempotent via `drive_id` + `craig_id`. |
+
+**Flux typique** : Craig poste `🔴 Recording...` → `craig-listener` écrit pending → recording dure N minutes → Craig édite en `Recording ended.` → `craig-watch` détecte (cron suivant) → invoque `craig-transcript-record/scan.py` → poll Drive jusqu'au zip (cook+upload Craig 1-15 min) → transcription Groq → raw écrit → LLM commit/push + `llm-wiki ingest`.
+
+**Routing entre instances Hermes** : 100 % Discord (catégorie + rôle). Chaque instance ne voit que SON `#craig-events` via les permissions Discord. Aucune décision de filtrage côté skills.
 
 ## Liens
 

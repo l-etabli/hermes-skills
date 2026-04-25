@@ -1,0 +1,152 @@
+---
+name: craig-listener
+description: "Active-toi sur tout message du bot Craig dans #craig-events de cette instance. Extrait le Recording ID, écrit un pending state si le recording est en cours (craig-watch prend le relais en cron), ou déclenche directement la transcription si le recording est déjà terminé. Pas de filtrage par channel : Discord garantit l'isolation entre instances."
+version: 1.0.0
+platforms: [linux]
+metadata:
+  hermes:
+    tags: [voice, transcript, craig, discord, event-driven]
+    category: voice
+    related_skills: [craig-transcript-record, craig-watch, llm-wiki]
+    requires_toolsets: [terminal]
+required_environment_variables:
+  - name: WIKI_PATH
+    prompt: "Chemin absolu vers le vault llm-wiki. Utilisé pour stocker l'état pending dans .craig-pending/ et hérité par craig-transcript-record."
+    required_for: full functionality
+  - name: GITHUB_TOKEN
+    prompt: "Token GitHub pour le push (refresh via la GitHub App). Hérité par craig-transcript-record."
+    required_for: full functionality
+  - name: GOOGLE_APPLICATION_CREDENTIALS
+    prompt: "Chemin du JSON Service Account Drive. Hérité par craig-transcript-record."
+    required_for: full functionality
+  - name: AUDIO_DRIVE_FOLDER_ID
+    prompt: "ID du dossier Drive d'auto-upload Craig. Hérité par craig-transcript-record."
+    required_for: full functionality
+  - name: GROQ_API_KEY
+    prompt: "Clé API Groq. Hérité par craig-transcript-record."
+    required_for: full functionality
+---
+
+# Craig Listener
+
+Pont **event-driven** entre Craig (bot Discord d'enregistrement vocal) et le pipeline de transcription. Trigger sur le message initial de Craig, écrit un état pending pour que `craig-watch` prenne le relais en cron.
+
+## Architecture Discord (rappel)
+
+```
+[Catégorie Perso]      role @perso       → Hermes-perso
+  └─ #craig-events     ← Craig autorecord post depuis voice-channels Perso
+[Catégorie Piloti]     role @piloti      → Hermes-piloti
+  └─ #craig-events     ← Craig autorecord post depuis voice-channels Piloti
+[Catégorie Telluris]   role @telluris    → Hermes-telluris
+  └─ #craig-events     ← Craig autorecord post depuis voice-channels Telluris
+```
+
+Chaque Hermes a uniquement le rôle de SA catégorie → ne voit que SON `#craig-events`. **Tout le routing est fait par Discord.** Ce skill ne prend AUCUNE décision de filtrage.
+
+## Cycle de vie d'un message Craig
+
+Craig pose **un seul** message dans `#craig-events`, qu'il **édite** (même `message_id`) au cours du recording :
+
+1. **Initial** (au start) :
+   ```
+   🔴 Recording...
+   Recording ID: GDy7gHgSqJC5
+   Channel: ⁠salon de test
+   Started: 15:06:15 (il y a 4 secondes)
+   Activity
+   00:00:00: @Jérôme joined the recording.
+   ```
+
+2. **Final** (à la fin, MÊME message édité) :
+   ```
+   Recording ended.
+   Recording ID: GDy7gHgSqJC5
+   Channel: ⁠salon de test
+   Started: 15:06:15 (il y a une minute)
+   Activity
+   00:00:00: @Jérôme joined the recording.
+   00:00:10: Autorecord stopped due to lack of users.
+   ```
+
+Hermes upstream **ne supporte pas `on_message_edit`** — donc le listener ne voit que la version initiale. Le bridge vers la version finale est `craig-watch` (cron 5 min) qui refetch le message via Discord API.
+
+## When to Use
+
+Active-toi **immédiatement** dès que tu reçois un message du bot Craig dans `#craig-events` qui contient `Recording ID:`. Cas typique : message initial avec `🔴 Recording...`.
+
+**Ne pas activer** si :
+- Le message ne contient pas `Recording ID:` (autre msg Craig, msg humain).
+- Tu es déjà en train de traiter un autre Recording ID dans ce run (séquentiel).
+
+## Procedure
+
+### 1. Acknowledge
+
+Réagis ⏳ au message Craig pour signaler que tu as bien capté.
+
+### 2. Lance `listener.py`
+
+Le script fait l'extraction regex + l'écriture pending. **Ne fais PAS l'extraction toi-même** — la logique critique vit dans le script (le LLM ignore parfois les instructions explicites du SKILL.md).
+
+Tu DOIS passer `--channel-id` et `--message-id` (lus depuis ton contexte Discord : `message.channel.id` et `message.id`) en plus du body :
+
+```bash
+# Body via stdin (recommandé : robuste aux quotes / sauts de ligne)
+printf '%s' "<contenu brut du message Craig>" | \
+  uv run --with google-auth --with google-api-python-client --with requests \
+    /opt/data/skills-shared/craig-listener/listener.py \
+    --channel-id "<discord channel id>" \
+    --message-id "<discord message id>"
+
+# Alternative : via fichier
+uv run --with google-auth --with google-api-python-client --with requests \
+    /opt/data/skills-shared/craig-listener/listener.py \
+    --message-file /tmp/craig-msg.txt \
+    --channel-id "<id>" --message-id "<id>"
+```
+
+Le script :
+1. Extrait `Recording ID: <id>` via regex.
+2. Si `"Recording ended."` est déjà dans le body (rare : Hermes a vu le panel après-coup) → invoque `craig-transcript-record/scan.py` direct.
+3. Sinon → écrit `$WIKI_PATH/.craig-pending/<craig_id>.json` avec `{craig_id, channel_id, message_id, first_seen_at}`. Le cron `craig-watch` prendra le relais.
+
+### 3. Lis le JSON et réagis
+
+```json
+{"status": "pending",        "craig_id": "...", "state_path": ".craig-pending/<id>.json"}
+{"status": "already-pending", "craig_id": "...", "state_path": ".craig-pending/<id>.json"}
+{"status": "processed",      "craig_id": "...", "path": "raw/transcripts/...", "drive_id": "...", "name": "..."}
+{"status": "skipped",        "craig_id": "...", "reason": "already-transcribed", "as": "..."}
+{"status": "error",          "craig_id": "...", "reason": "...", "detail": "..."}
+{"status": "error",          "reason": "no-recording-id|format-mismatch|empty-message|missing-discord-ids|bad-discord-ids", "detail": "..."}
+```
+
+- **`pending`** → silence côté Discord (la réaction ⏳ posée au step 1 reste). craig-watch s'occupera de la suite.
+- **`already-pending`** → l'event Discord a été reçu deux fois (rare, mais possible : reconnect bot, replay). Ne pose PAS une nouvelle réaction ⏳, ne renotifie pas. Le pending d'origine est toujours en vol.
+- **`processed`** → suis la procédure de `craig-transcript-record` à partir du step 3 (commit + push) puis step 4 (ingest llm-wiki). Notification ✅.
+- **`skipped` / `already-transcribed`** → réagis ✅ pour confirmer qu'on est au courant.
+- **`error` / `no-recording-id`** → ce n'était pas un message Craig de recording. Retire la réaction ⏳, ignore silencieusement.
+- **`error` / `format-mismatch`** → ⚠️ **bruyant** : le message ressemble à un panel Craig (présence de `🔴 Recording`, `Voice Region:`, etc.) mais la regex `Recording ID:` a échoué. Très probablement le format Craig a changé. Notifie l'utilisateur avec le snippet, pour qu'on puisse mettre à jour la regex. Ne plus jamais ignorer silencieusement ce cas — sinon on arrête de transcrire sans s'en rendre compte.
+- **`error` / `missing-discord-ids` / `bad-discord-ids`** → tu as oublié de passer `--channel-id` ou `--message-id`. Re-tente avec les bons paramètres.
+- **`error` / autres** → notifie ⚠️ avec `reason` + `detail`.
+
+## Pitfalls
+
+- **Ne pas pré-extraire le Recording ID toi-même** avant d'appeler le script. La regex vit dans `listener.py` — c'est l'ADN de ce skill.
+- **Ne pas filtrer par channel ID dans la prose ou en code.** Le routing Discord (permissions de catégorie) garantit déjà l'isolation.
+- **Ne PAS poll Drive depuis le LLM** en attendant la fin du recording. Le rôle du listener est de capter l'événement et déléguer à craig-watch via le pending state. Bloquer le LLM pendant des heures = anti-pattern.
+- **Pas de parallélisme** sur plusieurs Recording ID dans le même run.
+- **Pas de `git remote set-url`, pas de `export GITHUB_TOKEN`** — credential helper côté infra.
+
+## Verification
+
+1. Si `pending` : `$WIKI_PATH/.craig-pending/<craig_id>.json` existe avec les 4 champs.
+2. Si `processed` : voir checklist du skill `craig-transcript-record`.
+3. Le message Craig original a bien une réaction (⏳ tant qu'en attente, ✅ ou ⚠️ après).
+
+## Notes
+
+- **Pourquoi un script et pas du LLM** : extraction regex + écriture state = trivial, le coût LLM est inutile, et le LLM rate parfois des choses « évidentes ». Logique critique = code, pas prose.
+- **Cohabitation Hermes / Craig** : Hermes a un filtre `DISCORD_ALLOW_BOTS` qui par défaut ignore les messages de bots. Pour que ce listener s'active, il faut soit lever le filtre globalement (les permissions Discord garantissent l'isolation) soit whitelister `#craig-events`. Voir hermes-infra côté config.
+- **`.craig-pending/`** doit être gitignoré dans le wiki (state runtime, pas knowledge).
