@@ -95,26 +95,28 @@ Le champ `progress` (présent quand `scan.py` a tourné) est une liste ordonnée
 
 Tu t'en sers pour rédiger une UX live côté Discord (cf. step 2.5 ci-dessous).
 
-### 2.5. UX Discord : ÉDITER un message de status, pas en spammer N
+### 2.5. UX Discord : status message édité, pas spam
 
-Entre le moment où Craig pose `Recording ended.` et la notif finale ✅, il s'écoule 1-15 min (Drive cook + upload + Groq). L'utilisateur DOIT savoir où on en est sans recevoir 4 messages distincts.
+Entre le moment où Craig pose `Recording ended.` et la notif finale ✅, il s'écoule 1-15 min (Drive cook + upload + Groq). L'utilisateur DOIT savoir qu'on est en train de bosser, sans recevoir N messages distincts.
 
-**Règle absolue** : **un seul** message Discord par recording, **édité** à chaque transition. Jamais N nouveaux messages.
+**Règle absolue** : **un seul** message Discord par batch de recordings, **édité** une fois à la fin. Jamais plusieurs nouveaux messages.
 
-| Phase | Action LLM Discord |
+⚠️ **Limite architecturale connue** : `watch.py` est synchrone. Quand il revient avec son JSON, scan.py a déjà fini toutes ses phases (Drive poll + Groq + write). Le champ `progress[]` arrive en post-hoc, pas en live. Donc on ne peut PAS poster un message phase par phase pendant que ça tourne. La seule option est un pattern **2 temps** :
+
+| Étape | Action LLM Discord |
 |---|---|
-| craig-watch détecte `Recording ended.` (avant `invoke_scan`) — vu via le passage de `still_pending[]` à `processed[]` entre deux ticks | Poste **un nouveau message** dans le canal d'origine du panel Craig (pas `#craig-events` — le canal dans lequel le user a parlé du recording, ou `DISCORD_HOME_CHANNEL` à défaut) : « 🎙️ Recording terminé (`craig_id`), je récupère le zip Drive… ». **Mémorise son `message_id`** dans le contexte de ce run. |
-| `progress[i].phase == "zip-found"` | **Édite** ce message : « 📥 Zip trouvé (`<size_bytes>` → format MB), transcription Groq en cours… ». |
-| `progress[i].phase == "groq-start"` | (optionnel — peut sauter, la phase précédente est encore lisible.) |
-| `progress[i].phase == "writing-raw"` | (optionnel.) |
-| Résultat `processed` | **Édite** : « ✅ Transcript intégré : `<filename>` — N pages wiki updatées : [[a]], [[b]] ». |
-| Résultat `error` / `expired` / `drive-poll-timeout` | **Édite** avec ⚠️ + `reason` + `detail`. |
+| **AVANT** de lancer `watch.py` (s'il y a des entrées `still_pending` à traiter) | Poste un message dans `DISCORD_HOME_CHANNEL` : « ⏳ Je traite N recording(s) Craig en attente : `<craig_id_1>`, `<craig_id_2>`… (Drive cook + Groq, 1-15 min). Je reviens avec le résultat. ». **Mémorise son `message_id`** pour l'édition finale. |
+| **APRÈS** le retour de `watch.py`, pour chaque entrée `processed[i]` une fois commit/push/ingest fait | **Édite** ce même message en y ajoutant : « ✅ `<craig_id>` → `<filename>` — N pages wiki updatées : [[a]], [[b]] ». Si plusieurs entrées processed, liste-les sous le même msg. |
+| Entrée `error` / `expired` / `drive-poll-timeout` dans le résultat | **Édite** le même message avec ⚠️ + `craig_id` + `reason` + `detail`. |
 
-**Persistance du `message_id` entre ticks cron** : approche v1 = mémoire LLM dans le contexte du run en cours. C'est suffisant pour le cas standard où la chaîne complète (zip-found → processed) tient en un ou deux ticks de 5 min. **Limite connue** : si la chaîne s'étale sur plusieurs ticks (Drive lent + Groq lent), chaque tick redémarre avec un contexte vide → tu perds l'ID du message à éditer. v2 (à implémenter si on rencontre le cas) : stocker `discord_status_message_id` dans le pending JSON au moment du premier post.
+**Quand NE PAS poster de message du tout** :
+- `result["still_pending"]` vide (rien à traiter ce tick) → silence total, ne lance même pas watch.py si tu peux le savoir d'avance via `ls .craig-pending/`.
+- `result["processed"]` + `result["errors"]` + `result["expired"]` tous vides à la fin (rien à signaler) → si tu avais posté le ⏳ initial, **édite-le en `🤷 rien à signaler ce tick (tout encore en pending)`** plutôt que de le laisser bloqué sur ⏳.
+- `skipped` avec `reason: already-transcribed` exclusif → silence, supprime le ⏳ initial si posté.
 
-**Ne pose PAS de status message si** :
-- `result["processed"]`, `result["skipped"]`, `result["errors"]` sont tous vides ou ne concernent que des entrées du tick courant pour lesquelles tu n'as encore rien posté → silence (le user n'attend rien, ou alors on est dans un tick "rien à signaler").
-- Le résultat est `skipped` avec `reason: already-transcribed` ET tu n'as pas encore posté de status pour ce craig_id → silence (déjà transcrit avant, pas de bruit).
+**Note sur le `progress[]`** : tu peux l'inclure dans le message final pour le diagnostic (« Drive zip 42 MB, Groq OK, 2m13s de transcription ») — utile pour repérer un slowness anormal. Pas obligatoire en mode normal.
+
+**Future amélioration (Bloc B+)** : pour avoir un vrai live phase-par-phase, faudrait découper scan.py en stages invoqués sur ticks craig-watch séparés (à 30s ou 1 min), chaque tick éditant le message. Architecture lourde, hors scope actuel.
 
 ### 3. Pour chaque entrée de `processed[]` : commit + push + ingest
 
