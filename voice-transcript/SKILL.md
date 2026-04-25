@@ -26,8 +26,8 @@ required_environment_variables:
     prompt: "Clé API Groq (https://console.groq.com/keys) pour la transcription Whisper Large v3 Turbo."
     required_for: full functionality
   - name: HERMES_OWNED_CHANNEL_IDS
-    prompt: "Liste CSV d'IDs de channels Discord 'possédés' par cette instance (ex. 1497178585759485952,1497178585759485953). Chaque zip Craig contient un info.txt qui mentionne le Channel ID; le skill ne traite que les zips dont le Channel ID est dans cette liste. On filtre sur les channels et non sur la guild car plusieurs instances Hermes peuvent vivre sur le même serveur Discord, chacune écoutant un sous-ensemble de salons. Vide ou non défini = pas de filtrage (mode mono-instance)."
-    required_for: multi-instance setups
+    prompt: "Liste CSV d'IDs de channels Discord 'possédés' par cette instance (ex. 1497178585759485952,1497178585759485953). Requis pour le mode auto-scan. Chaque zip Craig contient un info.txt qui mentionne le Channel ID; le skill ne traite que les zips dont le Channel ID est dans cette liste. On filtre sur les channels et non sur la guild car plusieurs instances Hermes peuvent vivre sur le même serveur Discord, chacune écoutant un sous-ensemble de salons. Vide ou non défini = aucun audio n'est traité en auto-scan (l'instance ne sait pas ce qu'elle possède, on refuse par sécurité)."
+    required_for: full functionality
 ---
 
 # Voice Transcript
@@ -49,15 +49,17 @@ Pas besoin d'URL ni de nom de fichier : le skill liste, filtre, et traite tout c
 
 ## Cohabitation multi-instances
 
-Plusieurs instances Hermes (`perso`, `piloti`, `telluris`) peuvent partager le **même dossier Drive** (Craig n'a qu'une seule destination d'upload par compte Patreon, et plusieurs instances peuvent vivre sur le même serveur Discord avec des channels distincts). Le filtrage par "instance owner" se fait au niveau de `scan.py` via `HERMES_OWNED_CHANNEL_IDS` — **purement déterministe, pas de décision LLM** :
+Plusieurs instances Hermes (`perso`, `piloti`, `telluris`) peuvent partager le **même dossier Drive** (Craig n'a qu'une seule destination d'upload par compte Patreon, et plusieurs instances peuvent vivre sur le même serveur Discord avec des channels distincts). Le filtrage par "instance owner" se fait au niveau de `scan.py` via `HERMES_OWNED_CHANNEL_IDS` — **purement déterministe, pas de décision LLM**.
+
+`HERMES_OWNED_CHANNEL_IDS` est **obligatoire** pour le mode auto-scan : chaque instance doit lister explicitement les channels Discord qu'elle possède. Sans cette config, l'instance refuse de traiter quoi que ce soit en auto-scan (skipped reason `channel-filter-not-configured`) — c'est le seul comportement safe sur un Drive partagé : un Hermes fraîchement déployé ne peut pas, par accident, transcrire les conversations des autres faute de config.
+
+Comportement détaillé :
 
 - Pour chaque zip Craig, `scan.py` ouvre `info.txt` (présent à l'intérieur du zip) et y lit le **Channel ID Discord** (ligne `Channel: <name> (<id>)` — la regex capture uniquement l'ID numérique, pas le nom, donc renommer un channel ne casse rien).
-- Si le Channel ID n'est pas dans `HERMES_OWNED_CHANNEL_IDS`, le zip est marqué `foreign-channel` et ignoré silencieusement — c'est le boulot d'une autre instance.
-- Si `HERMES_OWNED_CHANNEL_IDS` est vide ou non défini, **aucun filtrage** — utile en mono-instance ou pour debug.
+- Si le Channel ID est dans `HERMES_OWNED_CHANNEL_IDS` → on transcrit. Sinon → skip (`foreign-channel`).
+- Pour les **audio directs** (sans `info.txt`), il n'y a aucun discriminator possible : ils sont **toujours ignorés en mode auto-scan** (`manual-audio-no-discriminator`) et ne sont traités que via trigger explicite (`--filename`, ou demande utilisateur ciblée sur un fichier précis).
 
-Pour les **audio directs** (sans `info.txt`), il n'y a pas de discriminator. Conséquence :
-- En **mode auto-scan** (cron, ou demande générique « scanne le drive »), les audio directs sont **ignorés** quand `HERMES_OWNED_CHANNEL_IDS` est non vide (`manual-audio-no-discriminator`), pour éviter le traitement parallèle par plusieurs instances.
-- En **mode trigger explicite** (`--filename meeting.mp3`, ou demande utilisateur ciblée sur un fichier précis), le filtrage Channel est court-circuité et le fichier est traité par l'instance qui reçoit la demande.
+En **mode trigger explicite** (`--filename meeting.mp3` ou `--craig-id <id>`), le filtrage Channel est court-circuité : l'utilisateur a explicitement désigné le fichier sur l'instance courante, donc on respecte sa volonté.
 
 ## When to Use
 

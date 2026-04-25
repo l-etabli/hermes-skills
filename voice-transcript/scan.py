@@ -14,18 +14,23 @@ Idempotent: each candidate's Drive ID is recorded in the raw frontmatter
 and re-runs skip already-processed files.
 
 Filtering (deterministic, no LLM):
-  - $HERMES_OWNED_CHANNEL_IDS (CSV) restricts Craig zips to those whose
-    info.txt names one of the listed Discord channel IDs. Channels —
-    not guilds — are the right discriminator: a single guild can host
-    several Hermes instances, each owning a subset of channels (e.g. an
-    "Établi" guild with #perso-*, #piloti-*, #telluris-* channels mapped
-    to the corresponding instance). Empty / unset means no filter.
-  - In auto-scan mode (default), direct audio files (mp3/m4a/wav/flac/ogg
-    without an info.txt sibling) are ignored when $HERMES_OWNED_CHANNEL_IDS
-    is non-empty — they have no discriminator and would otherwise be
-    processed by every co-tenant instance.
-  - In explicit-trigger mode (--filename <name>), the named file is always
-    processed, regardless of channel filtering.
+  - $HERMES_OWNED_CHANNEL_IDS is **required** for auto-scan mode:
+      * unset/empty -> skip every audio file. The instance has not been
+                         told what it owns; refusing to process anything
+                         is the only safe default on a shared Drive.
+      * "id1,id2"   -> filter Craig zips by the Discord channel IDs
+                         named in their info.txt. Channels — not guilds —
+                         because a single Discord guild can host several
+                         Hermes instances, each owning a subset of
+                         channels (e.g. an "Établi" guild with #perso-*,
+                         #piloti-*, #telluris-* mapped to the
+                         corresponding instance).
+  - Direct audio files (mp3/m4a/wav/flac/ogg without an info.txt) have
+    no discriminator and are *never* processed in auto-scan mode. They
+    must be triggered explicitly via --filename so the operator picks
+    the right instance.
+  - In explicit-trigger mode (--filename <name>), the named file is
+    always processed regardless of channel filtering.
 
 Output: a JSON object on stdout
   {
@@ -66,10 +71,15 @@ SA_PATH = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
 DRIVE_FOLDER_ID = os.environ["AUDIO_DRIVE_FOLDER_ID"]
 
 # Comma-separated list of Discord Channel IDs this instance is allowed
-# to process. Empty/unset means "no filter" (mono-instance setup).
+# to process. **Required**: an empty / unset value means the instance
+# has not been told what it owns, and scan.py will skip every audio
+# file in auto-scan mode. This forces every instance to opt in
+# explicitly, so a freshly-deployed Hermes can never race the others
+# on a shared Drive folder.
 OWNED_CHANNELS: set[str] = {
     c.strip() for c in os.environ.get("HERMES_OWNED_CHANNEL_IDS", "").split(",") if c.strip()
 }
+OWNED_CHANNELS_CONFIGURED: bool = bool(OWNED_CHANNELS)
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MAX_BYTES = 25 * 1024 * 1024
@@ -166,7 +176,9 @@ def prepare_audio(drive, f: dict, tmpdir: pathlib.Path):
         channel_id = extract_channel_id_from_zip(zip_path)
         if channel_id is None:
             return None, [], "craig", "no-info"
-        if OWNED_CHANNELS and channel_id not in OWNED_CHANNELS:
+        if not OWNED_CHANNELS_CONFIGURED:
+            return None, [], "craig", "not-configured"
+        if channel_id not in OWNED_CHANNELS:
             return None, [], "craig", "foreign"
         flac_paths: list[pathlib.Path] = []
         with zipfile.ZipFile(zip_path) as zf:
@@ -339,13 +351,19 @@ def main():
                 audio, speakers, source, owner = prepare_audio(drive, f, tmpdir)
                 # Guild filtering, only when not explicit-trigger
                 if not explicit_trigger:
+                    if owner == "not-configured":
+                        skipped.append({"name": f["name"], "reason": "channel-filter-not-configured"})
+                        continue
                     if owner == "foreign":
                         skipped.append({"name": f["name"], "reason": "foreign-channel"})
                         continue
                     if owner == "no-info":
                         skipped.append({"name": f["name"], "reason": "no-channel-info"})
                         continue
-                    if source == "manual" and OWNED_CHANNELS:
+                    if source == "manual":
+                        # Manual audio has no info.txt -> no channel
+                        # discriminator. Process only via explicit
+                        # --filename trigger, never in auto-scan.
                         skipped.append({"name": f["name"], "reason": "manual-audio-no-discriminator"})
                         continue
                 if audio is None:
