@@ -212,6 +212,18 @@ def main() -> int:
               "craig_id": craig_id})
         return 2
 
+    if args.channel_id == args.message_id:
+        # Caught a real LLM mistake: passing the same value for both
+        # collapses the channel/message distinction (the resulting GET
+        # /channels/<X>/messages/<X> Discord call always 404s). Refuse
+        # rather than write a doomed pending entry.
+        emit({"status": "error", "reason": "channel-equals-message",
+              "detail": "--channel-id and --message-id must be different snowflakes "
+                        "(channel-id is the #craig-events channel, message-id is the Craig panel msg). "
+                        "You almost certainly passed message.id for both — re-read the source message context.",
+              "craig_id": craig_id})
+        return 2
+
     state_path, is_new = write_pending(craig_id, args.channel_id, args.message_id)
     emit({
         "status": "pending" if is_new else "already-pending",

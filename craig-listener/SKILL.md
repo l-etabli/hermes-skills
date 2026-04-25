@@ -89,7 +89,12 @@ Réagis ⏳ au message Craig pour signaler que tu as bien capté.
 
 Le script fait l'extraction regex + l'écriture pending. **Ne fais PAS l'extraction toi-même** — la logique critique vit dans le script (le LLM ignore parfois les instructions explicites du SKILL.md).
 
-Tu DOIS passer `--channel-id` et `--message-id` (lus depuis ton contexte Discord : `message.channel.id` et `message.id`) en plus du body.
+Tu DOIS passer `--channel-id` ET `--message-id` (DEUX valeurs DIFFÉRENTES) :
+
+- **`--channel-id`** = ID du **canal** `#craig-events` (où Craig vient de poster). Dans le contexte Discord d'Hermes : **`message.channel.id`** ou équivalent platform context (`event.channel_id`, `payload["channel_id"]`...). C'est l'ID du SALON, pas du message.
+- **`--message-id`** = ID du **message** Craig que tu es en train de traiter. Dans le contexte : **`message.id`** ou `event.message_id`. C'est l'ID du MESSAGE individuel.
+
+⚠️ **Erreur fréquente** : passer `message.id` (ou son équivalent) pour LES DEUX champs. Le résultat est un pending JSON où `channel_id == message_id`, et au prochain tick craig-watch `GET /channels/<X>/messages/<X>` renverra 404 et la chaîne se bloque jusqu'à expiration. Le script REFUSE désormais ce cas avec `reason: "channel-equals-message"` — si tu vois cette erreur, relis le contexte source du message et extrais les deux IDs **distincts**.
 
 **Méthode recommandée — `--message-file` via tmpfile écrit hors shell** :
 le body Craig contient des zero-width chars (U+200B) que le security scanner Hermes flag si on l'inclut sur la cmdline shell (`printf %q "..."`, `sh -c`). Écris le body dans un tmpfile via un outil non-shell (write_file ou équivalent Python natif) puis passe `--message-file` :
