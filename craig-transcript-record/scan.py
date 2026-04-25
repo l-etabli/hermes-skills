@@ -291,6 +291,7 @@ def write_transcript(f: dict, tx: dict, speakers: list[str], craig_id: str) -> p
         f"drive_md5: {f.get('md5Checksum','')}\n"
         f"recorded_at: {recorded_at}\n"
         f"ingested: {today}\n"
+        f"duration_s: {duration_s}\n"
         f"sha256: {sha}\n"
         f"---\n\n"
     )
@@ -377,6 +378,7 @@ def main() -> int:
                 "path": str(out.relative_to(WIKI_PATH)),
                 "drive_id": f["id"],
                 "name": f["name"],
+                "duration_s": int(tx.get("duration", 0)),
             })
             return 0
     except subprocess.CalledProcessError as exc:
