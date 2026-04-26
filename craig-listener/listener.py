@@ -267,24 +267,31 @@ recordings Craig pending.
 
 Procedure stricte (UNE SEULE chose a faire) :
 
-1. Lance le script craig-pipeline :
+1. Lance le script craig-pipeline et capture sa sortie :
 
-   uv run --with requests --with jsonschema --with pyyaml \\
-       /opt/data/skills-shared/craig-pipeline/pipeline.py
+   uv run /opt/data/skills-shared/craig-pipeline/pipeline.py
 
-2. Reporte la sortie JSON telle quelle. C'est tout.
+2. Termine ta session SANS rien dire d'autre. Aucun message Discord
+   (le script s'en occupe : status thread dans #craig-events, recap
+   debrief dans #hermes-perso, ✅ final + cron remove quand termine).
+   Si tu veux logger la sortie JSON pour debug, fais-le SEULEMENT
+   dans un message de log non-Discord (ex. via emit_progress dans le
+   sandbox terminal). NE poste rien dans le chat.
 
-NE FAIS RIEN d'autre. NE touche pas a git, NE poste pas de message
-Discord, N'active pas craig-watch / llm-wiki / meeting-debrief.
-Le script s'occupe de TOUT : refetch panel Discord, scan.py,
-commit + push transcript, ingest llm-wiki via agent loop bufferise,
-generation debrief OpenRouter + debrief.py, suppression du cron quand
-.craig-pending/ se vide. Ces taches ont ete sorties du LLM apres bugs
-recurrents (push manquant, vandalisme index.md, status hallucines).
-
-Si le script echoue (rc != 0 ou status=error global), surface la sortie
-JSON et arrete-toi la. NE tente PAS de "rattraper" en faisant les
-operations a la main."""
+INTERDICTIONS strictes (chaque ligne ci-dessous a deja ete observee
+en prod et a cause des bugs) :
+- NE poste PAS dans Discord, ni en reply au panel Craig, ni dans
+  #hermes-perso, ni nulle part. Le script gere toute la visibilite.
+  Si tu vois "Suivi craig-watch termine" dans la sortie de
+  maybe_self_delete_cron, c'est que le SCRIPT vient deja de poster.
+  NE le re-poste PAS. C'est la cause d'un spam de ✅ doublons.
+- NE touche pas a git, ne lance pas scan.py / debrief.py / ingest
+  llm-wiki / craig-watch a la main. Le script compose tout cela.
+- NE relance PAS pipeline.py si le premier run a deja tourne (idem
+  spam : un seul run par tick).
+- Si le script echoue (rc != 0 ou status=error global), termine
+  silencieusement. NE tente pas de "rattraper" a la main. Le tick
+  suivant retentera automatiquement (le pipeline est idempotent)."""
 
 
 def ensure_followup_cron() -> str:

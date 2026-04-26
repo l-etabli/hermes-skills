@@ -1178,17 +1178,28 @@ def maybe_self_delete_cron() -> dict:
     list_proc = subprocess.run([str(HERMES_CLI), "cron", "list"], capture_output=True, text=True, timeout=15)
     job_id: str | None = None
     # `hermes cron list` prints blocks like:
-    #   <hex job id>
-    #   Name: craig-watch-followup
-    #   ...
-    # We grab the line immediately above `Name: <FOLLOWUP_CRON_NAME>`.
+    #   <hex job id> [active]
+    #     Name:      craig-watch-followup
+    #     Schedule:  every 5m
+    #     ...
+    # We scan for the `Name:` line, walk back up to 5 lines, take the
+    # FIRST whitespace-token of each candidate line and accept it iff
+    # it's a hex/dashed id (>=6 chars). Earlier we matched the WHOLE
+    # stripped line against the hex regex — the trailing ` [active]`
+    # broke the match and `maybe_self_delete_cron` reported
+    # `no-cron-found` every tick, so the cron never auto-removed and
+    # spammed #hermes-perso with ✅ messages until the user killed it
+    # manually.
     lines = list_proc.stdout.splitlines()
     for i, line in enumerate(lines):
         if FOLLOWUP_CRON_NAME in line and "Name" in line:
             for j in range(i - 1, max(-1, i - 5), -1):
-                cand = lines[j].strip()
-                if re.fullmatch(r"[0-9a-fA-F-]{6,}", cand):
-                    job_id = cand
+                tokens = lines[j].strip().split()
+                if not tokens:
+                    continue
+                first = tokens[0]
+                if re.fullmatch(r"[0-9a-fA-F-]{6,}", first):
+                    job_id = first
                     break
             if job_id:
                 break
