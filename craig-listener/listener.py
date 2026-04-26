@@ -273,8 +273,13 @@ Procedure stricte a chaque tick :
    execute sa procedure complete (refetch via Discord API -> si
    'Recording ended.' detecte -> scan.py -> commit/push wiki ->
    ingest llm-wiki -> meeting-debrief si processed.duration_s >= 180).
-   Pas de message Discord en mode 'still_pending' pur (silence si rien
-   a signaler ce tick).
+   IMPORTANT - visibilite : pour chaque pending traite, poste UN
+   message de status dans $CRAIG_EVENTS_CHANNEL_ID (reply au message
+   Craig original via message_reference.message_id = pending.message_id)
+   et EDITE-LE au fil des phases (Recording ended -> Transcrit ->
+   Wiki updated -> Debrief poste). Format detaille dans craig-watch
+   SKILL.md § "Visibilite dans #craig-events". L'utilisateur DOIT voir
+   l'avancement, pas attendre 10 min en aveugle.
 
 Anti-patterns (lecons apprises, NE PAS faire) :
 - N'invente jamais de craig_id, channel_id ou message_id : tout vient

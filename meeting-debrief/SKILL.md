@@ -37,44 +37,27 @@ Ce skill ne s'auto-trigger pas. Il est invoqué :
 
 ## Schéma JSON debrief
 
-Validé strictement par `meeting-debrief/schema.json` (Draft 2020-12). Toute déviation → `debrief.py` retourne `error/schema-mismatch` et exit 1, à toi de corriger et relancer.
+La structure canonique est `meeting-debrief/schema.json` (JSON Schema Draft 2020-12). Lis-le pour connaître la liste exacte des champs, leurs types, et les enums autorisés. `debrief.py` valide strictement contre ce schéma — toute déviation retourne `error/schema-mismatch` et exit 1.
 
-```json
-{
-  "transcript_path": "raw/transcripts/2026-04-25-craig-xxx-2026-04-25.md",
-  "tldr": "- Réunion produit avec X, Y\n- Décision sur Z\n- 3 actions à valider",
-  "decisions": [
-    "On part sur l'architecture A pour le module B."
-  ],
-  "open_questions": [
-    "Qui prend en charge l'audit sécu ?"
-  ],
-  "action_items": [
-    {
-      "id": 1,
-      "type": "bug",
-      "description": "Le dropdown du form étalonnage saute au scroll",
-      "suggested_action": {
-        "kind": "github-issue",
-        "target": "l-etabli/pilotis",
-        "body": "## Repro\n…"
-      },
-      "confidence": 0.85
-    },
-    {
-      "id": 2,
-      "type": "relance",
-      "description": "Relancer Acme dans 10 jours si pas de retour",
-      "suggested_action": {
-        "kind": "hermes-cron",
-        "target": "relance-acme-2026-05-05",
-        "when": "0 9 5 5 *"
-      },
-      "confidence": 0.7
-    }
-  ]
-}
-```
+> ⚠️ **Pas d'exemple JSON volontairement dans ce SKILL.md.** Vu en prod : le LLM copie verbatim tout exemple présent ici, même très clairement marqué synthétique, et le sert comme "vrai" debrief. La règle stricte : tu génères le JSON **uniquement** à partir du transcript que tu lis au step 1, en respectant la structure du `schema.json`. Aucune autre source.
+
+Champs clés (résumé pour la rédaction — la spec complète est dans schema.json) :
+
+- `transcript_path` — wiki-relatif (`raw/transcripts/<file>.md`).
+- `tldr` — 2-5 puces markdown qui résument ce qui a été RÉELLEMENT dit dans CE transcript.
+- `decisions[]` — décisions concrètes prises dans CE meeting. Liste vide si aucune.
+- `open_questions[]` — questions soulevées mais non résolues. Liste vide si aucune.
+- `action_items[]` — actions concrètes mentionnées dans CE transcript. Pour chacune :
+  - `id` — entier ≥ 1, unique dans la liste.
+  - `type` ∈ `bug | contact | relance | task | decision` — taxonomie sémantique.
+  - `description` — UNE phrase décrivant l'action.
+  - `suggested_action.kind` ∈ `github-issue | hermes-cron | gmail-draft | obsidian-note | linear-task` — cible technique.
+  - `suggested_action.target` — routing concret (`owner/repo`, nom-cron, email, chemin-vault, team-key — INFÉRÉ depuis le contexte du transcript et du contenu wiki déjà chargé par `llm-wiki`).
+  - `suggested_action.when` — requis pour `hermes-cron`. ISO ou cron.
+  - `suggested_action.body` — optionnel, markdown pré-rempli (github-issue, obsidian-note).
+  - `confidence` ∈ [0, 1] — auto-évaluation honnête. Si < 0.6, `debrief.py` le signalera au user.
+
+**Si le transcript ne mentionne aucune action concrète** (meeting de status, brainstorming sans engagement, test technique, smalltalk) : retourne `"action_items": []`. `debrief.py` skippera proprement avec `reason: no-actions`. **Toujours préférer un debrief vide à un debrief halluciné.** Une action inventée pollue le wiki et fait perdre confiance dans l'outil.
 
 Champs clés :
 
@@ -91,7 +74,7 @@ Quand tu es invoqué par `craig-watch` (step 5) ou manuellement sur un transcrip
 
 1. **Lis le transcript** : `raw/transcripts/<file>.md`. Récupère le frontmatter (`duration_s`, `recorded_at`, `source_url`) et le body (segments timestampés).
 
-2. **Génère le JSON debrief** conforme au schéma ci-dessus. Le contexte wiki déjà chargé par `llm-wiki` t'aide naturellement à inférer le bon `target` (ex. `bug du dropdown étalonnage` → `l-etabli/pilotis`).
+2. **Génère le JSON debrief** conforme au `schema.json`. Le contexte wiki déjà chargé par `llm-wiki` t'aide naturellement à inférer le bon `target` (mappe le sujet d'une action mentionnée dans le transcript vers le repo / cron / vault path qui le couvre dans le wiki — pas d'invention de cible).
 
    **Contrainte de longueur** : le recap markdown rendu (TLDR + decisions + open_questions + lignes d'action_items) ne doit PAS dépasser **~1800 caractères** une fois formaté — Discord cape le `content` d'un message à 2000 chars et `debrief.py` tronque silencieusement au-delà (avec un footer « recap tronqué »). Pour rester sous la limite :
    - TLDR concis (3-5 puces, pas un paragraphe entier — l'utilisateur a le transcript complet dans le wiki s'il veut creuser).

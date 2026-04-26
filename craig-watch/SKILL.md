@@ -219,9 +219,60 @@ Quand tu es invoqué dans le contexte du cron `craig-watch-followup` (vs. à la 
    - Récupère ton propre `job_id` via `/opt/hermes/.venv/bin/hermes cron list` (regarde la ligne hex au-dessus de `Name: craig-watch-followup`).
    - Supprime-toi : `/opt/hermes/.venv/bin/hermes cron remove <job_id>`.
    - Termine. **Ne pas continuer**, ne pas réactiver d'autre skill.
-3. **Sinon** (au moins un pending) : exécute la **Procedure** standard ci-dessus (run watch.py → commit/push/ingest pour processed → meeting-debrief si `duration_s ≥ 180`).
+3. **Sinon** (au moins un pending) : exécute la **Procedure** standard ci-dessus (run watch.py → commit/push/ingest pour processed → meeting-debrief si `duration_s ≥ 180`), avec la **visibilité** ci-dessous.
 
-En mode cron : **silence total** si `still_pending` exclusif (vs message ⏳ en user-driven). La politique de dedup d'erreurs (§ ci-dessous) est CRITIQUE — sinon une erreur Drive persistante spammerait toutes les 5 min.
+### Visibilité dans `#craig-events` (CRITIQUE)
+
+L'utilisateur a passé du temps à parler dans Craig — il veut voir où en est le traitement, pas juste recevoir le débrief final 10 min plus tard sans rien entre les deux. **Pas de silence pendant que tu bosses.**
+
+Pour chaque pending entry traitée dans le tick, poste UN message de status dans `$CRAIG_EVENTS_CHANNEL_ID` (idéalement en reply au message Craig original via `message_reference.message_id` = `pending.message_id`), puis **édite-le au fur et à mesure** des phases. Format suggéré :
+
+```
+🎙️ <craig_id>
+⏳ Recording en attente de fin (Craig pas encore "ended").
+```
+
+→ devient, quand tu detectes "Recording ended." :
+
+```
+🎙️ <craig_id>
+✅ Recording terminé. ⏳ Téléchargement Drive + transcription Groq…
+```
+
+→ devient, après scan.py `processed` :
+
+```
+🎙️ <craig_id>
+✅ Recording terminé.
+✅ Transcrit (<duration> min, <name>.flac).
+⏳ Ingest llm-wiki…
+```
+
+→ devient, après ingest :
+
+```
+🎙️ <craig_id>
+✅ Recording terminé.
+✅ Transcrit (<duration> min).
+✅ Wiki updaté (N pages : [[a]], [[b]]).
+⏳ Génération du debrief…
+```
+
+→ devient, après debrief posté :
+
+```
+🎙️ <craig_id>
+✅ Recording terminé.
+✅ Transcrit.
+✅ Wiki updaté.
+✅ Debrief posté dans #hermes-perso.
+```
+
+Si erreur à une phase : remplace l'⏳ par ⚠️ + raison brève. La politique de dedup d'erreurs (§ ci-dessous) reste appliquée pour ne pas spammer si l'erreur persiste.
+
+**Une seule** ligne `⏳` à la fois (la phase courante). Les phases passées restent en ✅. C'est plus parlant qu'un mur de logs.
+
+Le message de fin (debrief posté) reste tel quel, pas besoin de l'effacer ni de poster un récap supplémentaire dans `#craig-events`.
 
 ## Pitfalls
 
