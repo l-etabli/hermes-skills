@@ -250,6 +250,79 @@ def invoke_scan(craig_id: str) -> tuple[int, dict, list[dict]]:
     return proc.returncode, result, progress
 
 
+FOLLOWUP_CRON_NAME = "craig-watch-followup"
+
+
+def _followup_cron_prompt(hermes_cli: str) -> str:
+    return f"""\
+Tu es active par un cron tick toutes les 5 min pour suivre les recordings
+Craig en cours de traitement.
+
+Procedure stricte a chaque tick :
+1. Liste $WIKI_PATH/.craig-pending/*.json (via le shell terminal).
+2. Si la liste est VIDE :
+   - Poste UN message dans le canal $DISCORD_HOME_CHANNEL via
+     POST /channels/<id>/messages : '✅ Suivi craig-watch termine,
+     tous les recordings ont ete traites.'
+   - Recupere le job id de ce cron : `{hermes_cli} cron list` puis
+     grep -B1 le nom `{FOLLOWUP_CRON_NAME}` (l'id est l'hex sur la
+     ligne au-dessus de `Name:`).
+   - Supprime le cron : `{hermes_cli} cron remove <id>`.
+   - Termine. NE PAS continuer ni reactiver d'autre skill.
+3. Sinon (au moins un pending) : active le skill craig-watch et
+   execute sa procedure complete (refetch via Discord API -> si
+   'Recording ended.' detecte -> scan.py -> commit/push wiki ->
+   ingest llm-wiki -> meeting-debrief si processed.duration_s >= 180).
+   Pas de message Discord en mode 'still_pending' pur (silence si rien
+   a signaler ce tick).
+
+Anti-patterns (lecons apprises, NE PAS faire) :
+- N'invente jamais de craig_id, channel_id ou message_id : tout vient
+  de l'API Discord ou des fichiers .craig-pending/.
+- Si un script retourne `error`, surface l'erreur, NE PAS ecrire de
+  pending JSON ni bypass le script toi-meme.
+- Tous les calls REST Discord doivent inclure le header
+  `User-Agent: DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)`
+  (Cloudflare bloque le UA Python par defaut).
+- Politique de dedup d'erreurs (cf. craig-watch SKILL.md) toujours
+  appliquee : pas de spam si la meme erreur revient tick apres tick.
+"""
+
+
+def ensure_followup_cron() -> str:
+    """Make sure a craig-watch-followup cron is scheduled. Idempotent.
+
+    Returns one of: "created", "already-running", "failed: <reason>".
+    """
+    hermes_cli = os.environ.get("HERMES_CLI_PATH", "/opt/hermes/.venv/bin/hermes")
+    if not pathlib.Path(hermes_cli).exists():
+        return f"failed: hermes-cli-not-found: {hermes_cli}"
+
+    list_proc = subprocess.run(
+        [hermes_cli, "cron", "list"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if FOLLOWUP_CRON_NAME in list_proc.stdout:
+        return "already-running"
+
+    proc = subprocess.run(
+        [
+            hermes_cli, "cron", "create",
+            "every 5m",
+            "--name", FOLLOWUP_CRON_NAME,
+            "--skill", "craig-watch",
+            "--skill", "craig-transcript-record",
+            "--skill", "llm-wiki",
+            "--skill", "meeting-debrief",
+            _followup_cron_prompt(hermes_cli),
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return f"failed: cron-create: {(proc.stderr or proc.stdout)[:200]}"
+    return "created"
+
+
 def write_pending(craig_id: str, channel_id: str, message_id: str) -> tuple[pathlib.Path, bool]:
     """Returns (path, is_new). is_new=False means an entry already existed
     (listener fired twice on the same recording — duplicate Discord event)."""
@@ -321,6 +394,7 @@ def main() -> int:
         "status": "pending" if is_new else "already-pending",
         "craig_id": craig_id,
         "state_path": str(state_path.relative_to(WIKI_PATH)),
+        "followup_cron": ensure_followup_cron(),
     })
     return 0
 

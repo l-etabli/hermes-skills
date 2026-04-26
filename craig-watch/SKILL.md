@@ -201,16 +201,27 @@ Le script garde les pending entries en cas d'erreur transitoire — le tick suiv
 
 ## Cron config (côté Hermes)
 
-À ajouter dans `instances/<name>/config.yaml` (ou équivalent selon version Hermes) :
-
-```yaml
-crons:
-  - name: craig-watch
-    cron: "*/5 * * * *"
-    prompt: "Active le skill craig-watch et exécute sa procédure complète. Si rien à signaler (no processed, no expired, no errors), reste silencieux."
-```
+**Pas de cron permanent à provisionner.** Le cron `craig-watch-followup` est créé **dynamiquement** par `craig-listener/listener.py` (subprocess `hermes cron create`) à chaque nouveau recording, et **s'auto-supprime** quand `.craig-pending/` se vide. Voir § « Mode followup cron » ci-dessous.
 
 Cadence 5 min : la latence end-to-end est dominée par le cook+upload Craig (1-15 min), donc tick plus fréquent ne change rien.
+
+## Mode followup cron (auto-créé, auto-supprimé)
+
+Quand tu es invoqué dans le contexte du cron `craig-watch-followup` (vs. à la main par un user), comportement légèrement différent :
+
+### Tick handling
+
+À chaque tick (every 5m) :
+
+1. **Liste `$WIKI_PATH/.craig-pending/*.json`.**
+2. **Si vide** (tout a été processed/skipped/expired depuis le dernier tick) :
+   - Poste **un seul** message dans `$DISCORD_HOME_CHANNEL` : `✅ Suivi craig-watch terminé, tous les recordings ont été traités.`
+   - Récupère ton propre `job_id` via `/opt/hermes/.venv/bin/hermes cron list` (regarde la ligne hex au-dessus de `Name: craig-watch-followup`).
+   - Supprime-toi : `/opt/hermes/.venv/bin/hermes cron remove <job_id>`.
+   - Termine. **Ne pas continuer**, ne pas réactiver d'autre skill.
+3. **Sinon** (au moins un pending) : exécute la **Procedure** standard ci-dessus (run watch.py → commit/push/ingest pour processed → meeting-debrief si `duration_s ≥ 180`).
+
+En mode cron : **silence total** si `still_pending` exclusif (vs message ⏳ en user-driven). La politique de dedup d'erreurs (§ ci-dessous) est CRITIQUE — sinon une erreur Drive persistante spammerait toutes les 5 min.
 
 ## Pitfalls
 

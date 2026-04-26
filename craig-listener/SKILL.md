@@ -116,21 +116,23 @@ C'est tout. Le script va chercher le dernier msg Craig dans `#craig-events` via 
 Le script :
 1. Extrait `Recording ID: <id>` via regex.
 2. Si `"Recording ended."` est déjà dans le body (rare : Hermes a vu le panel après-coup) → invoque `craig-transcript-record/scan.py` direct.
-3. Sinon → écrit `$WIKI_PATH/.craig-pending/<craig_id>.json` avec `{craig_id, channel_id, message_id, first_seen_at}`. Le cron `craig-watch` prendra le relais.
+3. Sinon → écrit `$WIKI_PATH/.craig-pending/<craig_id>.json` avec `{craig_id, channel_id, message_id, first_seen_at}` ET déclenche **automatiquement** un cron `craig-watch-followup` (every 5m) qui prendra le relais. Idempotent : si le cron tourne déjà (recording précédent encore en vol), le script le voit et ne le recrée pas. Statut visible dans le champ `followup_cron` du JSON de sortie (`created` / `already-running` / `failed: <reason>`).
+
+**Pas de @mention manuelle requise** — la chaîne complète (refetch → scan → ingest → debrief) est portée par le cron auto-créé. Le cron s'auto-supprime quand `.craig-pending/` se vide (cf. craig-watch SKILL.md § « Mode followup cron »).
 
 ### 3. Lis le JSON et réagis
 
 ```json
-{"status": "pending",        "craig_id": "...", "state_path": ".craig-pending/<id>.json"}
-{"status": "already-pending", "craig_id": "...", "state_path": ".craig-pending/<id>.json"}
+{"status": "pending",        "craig_id": "...", "state_path": ".craig-pending/<id>.json", "followup_cron": "created|already-running|failed: ..."}
+{"status": "already-pending", "craig_id": "...", "state_path": ".craig-pending/<id>.json", "followup_cron": "created|already-running|failed: ..."}
 {"status": "processed",      "craig_id": "...", "path": "raw/transcripts/...", "drive_id": "...", "name": "..."}
 {"status": "skipped",        "craig_id": "...", "reason": "already-transcribed", "as": "..."}
 {"status": "error",          "craig_id": "...", "reason": "...", "detail": "..."}
 {"status": "error",          "reason": "no-recording-id|format-mismatch|empty-message|missing-discord-ids|bad-discord-ids", "detail": "..."}
 ```
 
-- **`pending`** → silence côté Discord (la réaction ⏳ posée au step 1 reste). craig-watch s'occupera de la suite.
-- **`already-pending`** → l'event Discord a été reçu deux fois (rare, mais possible : reconnect bot, replay). Ne pose PAS une nouvelle réaction ⏳, ne renotifie pas. Le pending d'origine est toujours en vol.
+- **`pending`** → silence côté Discord (la réaction ⏳ posée au step 1 reste). Le cron `craig-watch-followup` a été déclenché automatiquement (vérifie `followup_cron`). Si `failed: <reason>` → ⚠️ noisy : surface la raison à l'utilisateur car la chaîne ne tournera pas en auto, fallback @mention manuel possible.
+- **`already-pending`** → l'event Discord a été reçu deux fois (rare, mais possible : reconnect bot, replay). Ne pose PAS une nouvelle réaction ⏳, ne renotifie pas. Le pending d'origine est toujours en vol. (Dans ce cas, `followup_cron` sera typiquement `already-running`.)
 - **`processed`** → la sortie contient un champ `progress[]` avec les phases qu'a franchies `scan.py`. Suis la **UX live** ci-dessous (path direct : pas de pending, donc l'utilisateur découvre la chaîne en un seul passage). Puis suis la procédure `craig-transcript-record` à partir du step 3 (commit + push) puis step 4 (ingest llm-wiki). Notification ✅.
 - **`skipped` / `already-transcribed`** → réagis ✅ pour confirmer qu'on est au courant.
 - **`error` / `no-recording-id`** → ce n'était pas un message Craig de recording. Retire la réaction ⏳, ignore silencieusement.
