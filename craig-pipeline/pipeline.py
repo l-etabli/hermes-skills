@@ -395,9 +395,15 @@ def git_commit_push(repo: pathlib.Path, files: list[str], msg: str) -> tuple[str
     try:
         for f in files:
             git(repo, "add", "--", f)
-        status = git(repo, "status", "--porcelain")
+        # `git status --porcelain` lists untracked entries too (??),
+        # so a clean working tree with stray untracked dirs (like the
+        # gitignored .craig-debriefs-pending/) would falsely report
+        # "something to commit" and trigger an empty `git commit` that
+        # dies with "nothing to commit, working tree clean". Use
+        # `diff --cached --quiet` instead — exit 0 means nothing staged.
+        diff = git(repo, "diff", "--cached", "--quiet", check=False)
         new_commit = False
-        if status.stdout.strip():
+        if diff.returncode != 0:
             git(repo, "commit", "-m", msg)
             new_commit = True
 
