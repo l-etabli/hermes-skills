@@ -41,14 +41,14 @@ Output (stdout, one JSON object per line):
 
   {
     "status": "processed",
-    "path":   "raw/transcripts/2026-04-25-craig-xxx.md",
+    "path":   "raw/transcripts/2026-04-25-1437-craig.md",
     "drive_id": "...",
     "name":   "craig_xxx_2026-04-25_14-37-58.flac.zip"
   }
   {
     "status": "skipped",
     "reason": "already-transcribed",
-    "as":     "raw/transcripts/2026-04-25-craig-xxx.md"
+    "as":     "raw/transcripts/2026-04-25-1437-craig.md"
   }
   {
     "status": "error",
@@ -261,7 +261,12 @@ def write_transcript(f: dict, tx: dict, speakers: list[str], craig_id: str) -> p
     dur_text = f"{duration_s // 60}m {duration_s % 60}s"
     lang = tx.get("language", "?")
 
-    slug = f"craig-{craig_id.lower()}-{slugify(date)}"
+    # Format slug as <HHMM>-craig (e.g. "1240-craig"). Combined with the
+    # date prefix in out_path below, the full filename reads
+    # "<date>-<HHMM>-craig.md" — sortable, human-readable, no opaque ID.
+    # craig_id remains in source_url + drive_id frontmatter for traceability.
+    hhmm = recorded_at.split(" ")[1].replace(":", "") if " " in recorded_at else "0000"
+    slug = f"{hhmm}-craig"
     src_url = f"https://craig.horse/rec/{craig_id}"
 
     speakers_line = ", ".join(speakers) if speakers else "???"
@@ -274,7 +279,7 @@ def write_transcript(f: dict, tx: dict, speakers: list[str], craig_id: str) -> p
     body = "\n".join(body_lines).rstrip() + "\n"
 
     body_full = (
-        f"# Transcription {slug}\n\n"
+        f"# Transcription Craig {recorded_at}\n\n"
         f"- **Source audio** : `{name}`\n"
         f"- **Date** : {recorded_at}\n"
         f"- **Durée** : {dur_text}\n"

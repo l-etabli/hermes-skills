@@ -82,14 +82,14 @@ Quand tu es invoqué par `craig-watch` (step 5) ou manuellement sur un transcrip
    - Pour les `action_items`, le `description` doit tenir en 1 phrase ; pousse les détails (repro steps, body issue, etc.) dans `suggested_action.body` qui n'apparaît PAS dans le recap Discord — il sera utilisé seulement par dispatch downstream (issue github, draft mail, …).
    - Si tu sens que le recap dépasse, retire des `action_items` faibles (`confidence < 0.6`) plutôt que tronquer du contenu high-signal.
 
-3. **Écris-le** dans `$WIKI_PATH/raw/debriefs/<date>-<slug>.json` (le slug est dérivé du nom du transcript, sans l'extension `.md`). Crée le dossier si besoin.
+3. **Écris-le** dans `$WIKI_PATH/raw/debriefs/<basename>.json` où `<basename>` est le nom du transcript sans l'extension `.md`. Exemple : transcript `raw/transcripts/2026-04-26-1240-craig.md` → debrief `raw/debriefs/2026-04-26-1240-craig.json`. Le naming est strictement un mirror du transcript pour faciliter la corrélation et le tri chronologique. Crée le dossier si besoin.
 
 4. **Invoke le script** :
 
    ```bash
    uv run --with requests --with jsonschema --with pyyaml \
        /opt/data/skills-shared/meeting-debrief/debrief.py \
-       --debrief-path raw/debriefs/<date>-<slug>.json
+       --debrief-path raw/debriefs/<basename>.json
    ```
 
 5. **Lis le JSON de sortie** :
@@ -153,7 +153,7 @@ Quand tu reçois un message Discord :
 
 ### Phase 1
 
-1. `$WIKI_PATH/raw/debriefs/<date>-<slug>.json` existe et passe `jsonschema` :
+1. `$WIKI_PATH/raw/debriefs/<basename>.json` existe et passe `jsonschema` :
 
    ```bash
    uv run --with jsonschema python3 -c '

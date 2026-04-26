@@ -153,14 +153,14 @@ b. **Lis** `raw/transcripts/<path>.md` (le `path` est `processed[i].path`, wiki-
 
 c. **Génère** le JSON debrief conforme à `meeting-debrief/schema.json` (cf. `meeting-debrief/SKILL.md` § Schéma).
 
-d. **Écris-le** dans `$WIKI_PATH/raw/debriefs/<date>-<slug>.json` (slug = basename du transcript sans `.md`).
+d. **Écris-le** dans `$WIKI_PATH/raw/debriefs/<basename>.json` où `<basename>` = nom du transcript sans `.md` (mirror strict pour la corrélation, ex. `2026-04-26-1240-craig.md` → `2026-04-26-1240-craig.json`).
 
 e. **Invoke** :
 
    ```bash
    uv run --with requests --with jsonschema --with pyyaml \
        /opt/data/skills-shared/meeting-debrief/debrief.py \
-       --debrief-path raw/debriefs/<date>-<slug>.json
+       --debrief-path raw/debriefs/<basename>.json
    ```
 
 f. **Lis le JSON de sortie** :
