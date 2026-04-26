@@ -587,10 +587,20 @@ Règles strictes :
 """
 
 
-def _is_safe_wiki_path(p: str) -> tuple[pathlib.Path | None, str | None]:
-    """Resolve a user-supplied wiki-relative path. Reject absolute paths,
-    escapes via .., and any path inside raw/ or .craig-*/. Returns
-    (absolute_path, error)."""
+def _resolve_wiki_path(p: str, *, for_write: bool) -> tuple[pathlib.Path | None, str | None]:
+    """Resolve a user-supplied wiki-relative path.
+
+    Common rejects (read AND write): empty, absolute, .. escape, .git/,
+    or anything resolving outside the wiki root.
+
+    Write-only rejects: raw/ (transcripts + debriefs are owned by the
+    pipeline, not the LLM), and .craig-*/ (runtime state). Reads on
+    those paths ARE allowed — the LLM legitimately needs to read the
+    transcript it's about to ingest, otherwise it hallucinates the
+    contents and proposes patches that miss (this exact failure mode
+    was observed on 2026-04-26 — the agent guessed a `patch find` for
+    log.md that wasn't there, the apply step blew up, the guards
+    caught it but the wiki ingest was a no-op)."""
     if not p or not isinstance(p, str):
         return None, "empty path"
     if p.startswith("/"):
@@ -599,16 +609,25 @@ def _is_safe_wiki_path(p: str) -> tuple[pathlib.Path | None, str | None]:
     if any(part == ".." for part in norm.parts):
         return None, "path escape (..) not allowed"
     parts = norm.parts
-    if parts and parts[0] in ("raw",):
-        return None, "raw/ is read-only for ingest"
-    if parts and parts[0].startswith(".craig"):
-        return None, ".craig-*/ is runtime state, not wiki content"
+    if parts and parts[0] == ".git":
+        return None, ".git/ is off-limits"
+    if for_write:
+        if parts and parts[0] == "raw":
+            return None, "raw/ is read-only for ingest (transcripts + debriefs are pipeline-owned)"
+        if parts and parts[0].startswith(".craig"):
+            return None, ".craig-*/ is runtime state, not wiki content"
     abs_path = (WIKI_PATH / norm).resolve()
     try:
         abs_path.relative_to(WIKI_PATH.resolve())
     except ValueError:
         return None, "path resolves outside wiki root"
     return abs_path, None
+
+
+def _is_safe_wiki_path(p: str) -> tuple[pathlib.Path | None, str | None]:
+    """Backwards-compat shim — defaults to write-mode (the strictest).
+    New code should call _resolve_wiki_path directly with for_write=."""
+    return _resolve_wiki_path(p, for_write=True)
 
 
 def _wiki_baseline(wiki: pathlib.Path) -> dict[str, dict]:
@@ -668,7 +687,10 @@ def _read_llm_wiki_skill() -> str:
 
 def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
     if name == "read_file":
-        abs_path, err = _is_safe_wiki_path(args.get("path", ""))
+        # Reads can target raw/transcripts/<file>.md — the LLM needs to
+        # actually see the transcript it's ingesting, otherwise it
+        # patches log.md from a hallucinated body.
+        abs_path, err = _resolve_wiki_path(args.get("path", ""), for_write=False)
         if err:
             return {"error": err}
         if not abs_path or not abs_path.exists():
@@ -680,7 +702,8 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
         except Exception as exc:
             return {"error": f"read failed: {type(exc).__name__}: {exc}"}
         # Cap content returned to the model — single huge file shouldn't
-        # blow context. 50KB is generous for a wiki page.
+        # blow context. 50KB is generous for a wiki page or a 30 min
+        # transcript.
         if len(text) > 50_000:
             return {"content": text[:50_000], "truncated": True, "total_bytes": len(text)}
         return {"content": text}
@@ -690,7 +713,7 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
         if path in (".", ""):
             abs_path = WIKI_PATH
         else:
-            abs_path, err = _is_safe_wiki_path(path)
+            abs_path, err = _resolve_wiki_path(path, for_write=False)
             if err:
                 return {"error": err}
         if not abs_path or not abs_path.exists() or not abs_path.is_dir():
@@ -698,7 +721,11 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
         entries = []
         for e in sorted(abs_path.iterdir()):
             rel = e.relative_to(WIKI_PATH).as_posix()
-            if rel.startswith("raw/") or rel.startswith(".craig") or rel.startswith(".git"):
+            # .git is genuinely off-limits even for listing — no value
+            # to the LLM, lots of clutter. .craig-*/ is gitignored
+            # state. raw/ on the other hand IS legitimate to list when
+            # the LLM wants to cite siblings of the transcript.
+            if rel.startswith(".git") or rel.startswith(".craig"):
                 continue
             entries.append({"name": e.name, "type": "dir" if e.is_dir() else "file"})
         return {"entries": entries}
@@ -706,7 +733,9 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
     if name == "propose_edit":
         action = args.get("action")
         path = args.get("path", "")
-        abs_path, err = _is_safe_wiki_path(path)
+        # Writes still bound to the read-write surface (excludes raw/
+        # and .craig-*/) — only reads got the broader path.
+        abs_path, err = _resolve_wiki_path(path, for_write=True)
         if err:
             return {"status": "rejected", "reason": err}
         if not abs_path:
