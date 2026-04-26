@@ -30,6 +30,12 @@ hermes-skills/
 │   ├── schema.json
 │   ├── debrief.py
 │   └── dispatch.py
+├── wiki-quick/               # mention user : drop conversationnel -> raw/notes/ + push
+│   ├── SKILL.md
+│   └── quick_ingest.py
+├── weekly-digest/            # cron : récap vendredi + briefing lundi dans home channel
+│   ├── SKILL.md
+│   └── digest.py
 └── …
 ```
 
@@ -116,6 +122,39 @@ Famille **Craig** — capture event-driven des recordings vocaux Discord (Craig 
 **Flux typique** : Craig poste `🔴 Recording...` → `craig-listener` écrit pending → recording dure N minutes → Craig édite en `Recording ended.` → `craig-watch` détecte (cron suivant) → invoque `craig-transcript-record/scan.py` → poll Drive jusqu'au zip (cook+upload Craig 1-15 min) → transcription Groq → raw écrit → LLM commit/push + `llm-wiki ingest` → `meeting-debrief` génère le recap dans `DISCORD_HOME_CHANNEL` avec thread de validation → user valide, `meeting-debrief/dispatch.py` route vers les skills cibles.
 
 **Routing entre instances Hermes** : 100 % Discord (catégorie + rôle). Chaque instance ne voit que SON `#craig-events` via les permissions Discord. Aucune décision de filtrage côté skills.
+
+Famille **Wiki texte** — capture conversationnelle Discord -> KB :
+
+| Skill | Catégorie | Trigger | Rôle |
+|---|---|---|---|
+| [`wiki-quick`](./wiki-quick/) | research | Mention user (« wiki ça », « ingest cette conv ») | Drop conversationnel : pose le contenu dans `raw/notes/<slug>.md` du KB avec frontmatter (`source: discord`, `captured_by: wiki-quick`, `channel`, `participants`), pull/commit/push. Aucun appel LLM. L'agent enchaîne avec `llm-wiki ingest <path>` pour la promotion en pages `entities/`/`concepts/` selon les seuils du SCHEMA. |
+| [`weekly-digest`](./weekly-digest/) | kb | Cron 2× / semaine | `--recap` vendredi 17h (3 bullets décidé/livré/noté), `--briefing` lundi 9h (objectifs/actions reprises/blocages/échéances). Lit l'historique 7j des channels visibles au bot via Discord REST, 1 appel OpenRouter, POST dans `$DISCORD_HOME_CHANNEL`, append au `log.md` du KB. Posté dans le **même canal** pour continuité visuelle (le briefing lundi affiche le récap vendredi juste au-dessus). |
+
+### Exemples rapides
+
+**`wiki-quick`** — invoqué par l'agent quand l'user demande explicitement à archiver. Le contenu passe sur stdin :
+
+```bash
+cat <<'EOF' | uv run --with pyyaml /opt/data/skills-shared/wiki-quick/quick_ingest.py \
+    --channel "#perso-home" \
+    --participants "jerome,manu" \
+    --title "stack typescript piloti -> effect"
+Manu pense que la stack TypeScript pour Piloti devrait migrer vers Effect.
+Mon contre-argument : courbe d'apprentissage pour Louise, pas urgent.
+EOF
+# {"status":"ok","path":"raw/notes/2026-04-26-2310-stack-typescript-piloti.md","sha":"a1b2c3d4",...}
+```
+
+L'agent enchaîne ensuite avec `llm-wiki ingest raw/notes/2026-04-26-2310-stack-typescript-piloti.md`.
+
+**`weekly-digest`** — exécuté par cron, mode passé en argument :
+
+```bash
+uv run --with requests --with pyyaml /opt/data/skills-shared/weekly-digest/digest.py --recap
+# {"status":"ok","mode":"recap","channels_scanned":4,"messages_collected":87,"discord_message_id":"...","log_sha":"..."}
+```
+
+Crons installés via `hermes-infra/scripts/install-weekly-digest-cron.sh` (one-shot, boucle sur les 3 instances, `docker exec -u hermes` pour respecter le piège UID 10000).
 
 ## Liens
 
