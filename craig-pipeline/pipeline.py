@@ -123,6 +123,15 @@ OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 FOLLOWUP_CRON_NAME = "craig-watch-followup"
 
+# The github-app refresher sidecar mints a fresh installation token
+# every 45 min and writes it as `GITHUB_TOKEN=<token>` to this file.
+# The Hermes gateway reloads it via load_dotenv() on each LLM session,
+# but a subprocess like pipeline.py inherits a snapshot env that may
+# predate the latest refresh — and `terminal.env_passthrough` on
+# config.yaml is no help if the sandbox launched before the token
+# rotation. So we always re-read the file at push time.
+GITHUB_ENV_FILE = pathlib.Path(os.environ.get("HERMES_ENV_FILE", "/opt/data/.env"))
+
 # Hallucination markers we've actually seen the LLM write into wiki
 # pages: tool-call response chatter that should never end up on disk.
 HALLUCINATION_RES = [
@@ -187,6 +196,18 @@ def discord_get_message(channel_id: str, message_id: str) -> tuple[dict | None, 
     return _discord_request("GET", f"/channels/{channel_id}/messages/{message_id}")
 
 
+def discord_create_thread(channel_id: str, message_id: str, name: str) -> tuple[str | None, str | None]:
+    """Open a thread anchored on `message_id`. Returns (thread_id, err)."""
+    msg, err = _discord_request(
+        "POST",
+        f"/channels/{channel_id}/messages/{message_id}/threads",
+        json={"name": name[:100], "auto_archive_duration": 1440},
+    )
+    if err:
+        return None, err
+    return str(msg["id"]), None
+
+
 # Copied from craig-listener/listener.py (Components V2 walker). Craig's
 # recording panel uses Discord Components V2 (flags & 32768) and the
 # panel text lives nested in components[].components[].content, not in
@@ -223,12 +244,11 @@ ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
 
 # ----------------------------- status renderer -----------------------------
 
-def render_status(date_hhmm: str, lines: list[tuple[str, str]]) -> str:
-    icons = {"done": "✅", "inprogress": "⏳", "error": "⚠️"}
-    out = [f"🎙️ Recording {date_hhmm}"]
-    for kind, txt in lines:
-        out.append(f"{icons.get(kind, '•')} {txt}")
-    return "\n".join(out)
+PHASE_ICON = {"done": "✅", "inprogress": "⏳", "error": "⚠️"}
+
+
+def fmt_phase(kind: str, text: str) -> str:
+    return f"{PHASE_ICON.get(kind, '•')} {text}"
 
 
 def parse_first_seen(pending: dict) -> str:
@@ -317,6 +337,38 @@ def git(repo: pathlib.Path, *args: str, check: bool = True) -> subprocess.Comple
     )
 
 
+def _read_github_token() -> str | None:
+    """Pull the freshest GITHUB_TOKEN from the instance .env (the file
+    the github-app refresher sidecar writes to). Returns None if the
+    file is unreadable or has no GITHUB_TOKEN line — in which case
+    git push will fail with a clear push-no-token error rather than
+    git's interactive-prompt-on-no-tty 'No such device' confusion."""
+    try:
+        text = GITHUB_ENV_FILE.read_text(encoding="utf-8")
+    except Exception:
+        # Fall back to env var (set if terminal.env_passthrough exposed it).
+        return os.environ.get("GITHUB_TOKEN") or None
+    for line in text.splitlines():
+        if line.startswith("GITHUB_TOKEN="):
+            return line.split("=", 1)[1].strip() or None
+    return os.environ.get("GITHUB_TOKEN") or None
+
+
+def _push_url_with_token(repo: pathlib.Path, token: str) -> str | None:
+    """Compose an https push URL with the token embedded inline so we
+    don't have to touch .git/config or write a credential helper to
+    disk (both leak the token long-term). The token is passed only to
+    this single git push process and never stored."""
+    try:
+        remote = git(repo, "remote", "get-url", "origin").stdout.strip()
+    except subprocess.CalledProcessError:
+        return None
+    m = re.match(r"^https://github\.com/([^/]+/[^/]+?)(\.git)?$", remote)
+    if not m:
+        return None
+    return f"https://x-access-token:{token}@github.com/{m.group(1)}.git"
+
+
 def git_commit_push(repo: pathlib.Path, files: list[str], msg: str) -> tuple[str | None, str | None]:
     """Stage `files`, commit with msg, push to origin. Returns (sha, err).
     sha=None and err=None means no-op (nothing to commit)."""
@@ -328,9 +380,30 @@ def git_commit_push(repo: pathlib.Path, files: list[str], msg: str) -> tuple[str
             return None, None  # no-op
         git(repo, "commit", "-m", msg)
         head = git(repo, "rev-parse", "HEAD").stdout.strip()
-        push = git(repo, "push", check=False)
+
+        # Resolve a push URL with the GitHub App installation token
+        # embedded inline. If we let git fall back to the bare https
+        # remote, it tries to read a credential helper / prompt for a
+        # username and dies with `No such device or address` on the
+        # headless container.
+        token = _read_github_token()
+        if not token:
+            return None, "push-no-token: GITHUB_TOKEN absent from /opt/data/.env"
+        push_url = _push_url_with_token(repo, token)
+        if not push_url:
+            return None, "push-bad-remote: origin is not an https://github.com/... URL"
+
+        # Pass the URL via stdin-friendly arg form. Branch is HEAD ->
+        # whatever upstream is configured (origin/main here).
+        push = subprocess.run(
+            ["git", "-C", str(repo), "push", push_url, "HEAD"],
+            capture_output=True, text=True,
+        )
         if push.returncode != 0:
-            return None, f"push-failed: {(push.stderr or push.stdout)[:200]}"
+            # Scrub the token if it ever leaks into stderr (shouldn't,
+            # but git can echo URLs in some failure modes).
+            scrubbed = (push.stderr or push.stdout).replace(token, "***")[:200]
+            return None, f"push-failed: {scrubbed}"
         return head[:8], None
     except subprocess.CalledProcessError as exc:
         return None, f"git: {exc.cmd[1:]} -> {exc.stderr[:200]}"
@@ -1079,6 +1152,53 @@ def maybe_self_delete_cron() -> dict:
 
 # ----------------------------- per-pending pipeline -----------------------------
 
+def _ensure_status_thread(pending: dict, pending_path: pathlib.Path,
+                          panel_id: str | None, date_hhmm: str) -> tuple[str | None, str | None, str | None]:
+    """Make sure we have a header message in #craig-events (replying to
+    Craig's panel) and a thread anchored on it. Persists both IDs in the
+    pending JSON so a crash mid-flow re-uses the same thread on retry
+    (no duplicate headers, no duplicate threads — duplicate per-phase
+    messages within the thread are acceptable noise).
+    Returns (header_id, thread_id, err)."""
+    header_id = pending.get("pipeline_header_message_id")
+    thread_id = pending.get("pipeline_thread_id")
+
+    if header_id and thread_id:
+        # Verify the thread still exists; if Discord 404s, fall through
+        # and re-create.
+        _, err = _discord_request("GET", f"/channels/{thread_id}")
+        if not err:
+            return header_id, thread_id, None
+        header_id = None
+        thread_id = None
+
+    header = (
+        f"🎙️ Recording {date_hhmm}\n"
+        f"Suivi du pipeline ↓ (réponses dans le thread ci-dessous)."
+    )
+    new_header_id, err = discord_post(
+        CRAIG_EVENTS_CHANNEL_ID, header, reply_to=panel_id,
+    )
+    if err:
+        return None, None, f"header-post: {err}"
+
+    new_thread_id, err = discord_create_thread(
+        CRAIG_EVENTS_CHANNEL_ID, new_header_id, f"Recording {date_hhmm}",
+    )
+    if err:
+        # Header is already up; record it but bail. Worst case the
+        # phase messages will land directly under the header on retry
+        # next tick (and pending JSON will be re-tried).
+        pending["pipeline_header_message_id"] = new_header_id
+        save_pending(pending_path, pending)
+        return new_header_id, None, f"thread-create: {err}"
+
+    pending["pipeline_header_message_id"] = new_header_id
+    pending["pipeline_thread_id"] = new_thread_id
+    save_pending(pending_path, pending)
+    return new_header_id, new_thread_id, None
+
+
 def process_pending(pending_path: pathlib.Path) -> dict:
     pending = load_pending(pending_path)
     craig_id = pending.get("craig_id") or pending_path.stem
@@ -1092,8 +1212,6 @@ def process_pending(pending_path: pathlib.Path) -> dict:
     if panel_id:
         panel, err = discord_get_message(channel_id, panel_id)
         if err:
-            # Could be 404 (panel deleted) or transient. Don't post status,
-            # just bubble up — keep the pending so a human can decide.
             summary.update({"phase": "panel-refetch-failed", "detail": err})
             return summary
         body = extract_message_text(panel or {})
@@ -1102,158 +1220,127 @@ def process_pending(pending_path: pathlib.Path) -> dict:
             return summary
     # If panel_id missing (manual pending), skip the refetch; assume ended.
 
-    # Phase 1 — initial status post.
-    status_lines: list[tuple[str, str]] = [("inprogress", "Téléchargement Drive…")]
-    status_msg_id = pending.get("pipeline_status_message_id")
-    if status_msg_id:
-        # Resume: edit existing status message.
-        edit_err = discord_edit(CRAIG_EVENTS_CHANNEL_ID, status_msg_id,
-                                render_status(date_hhmm, status_lines))
-        if edit_err:
-            # Message was deleted? Re-post and update pending.
-            status_msg_id = None
-    if not status_msg_id:
-        new_id, err = discord_post(
-            CRAIG_EVENTS_CHANNEL_ID,
-            render_status(date_hhmm, status_lines),
-            reply_to=panel_id,
-        )
-        if err:
-            summary.update({"phase": "status-post-failed", "detail": err})
-            return summary
-        status_msg_id = new_id
-        pending["pipeline_status_message_id"] = status_msg_id
-        save_pending(pending_path, pending)
+    # Phase 1 — header + thread (idempotent across retries).
+    header_id, thread_id, err = _ensure_status_thread(
+        pending, pending_path, panel_id, date_hhmm,
+    )
+    if err or not thread_id:
+        summary.update({"phase": "status-init-failed", "detail": err})
+        return summary
 
-    def update_status(lines: list[tuple[str, str]]) -> None:
-        discord_edit(CRAIG_EVENTS_CHANNEL_ID, status_msg_id,  # type: ignore[arg-type]
-                     render_status(date_hhmm, lines))
+    def post_phase(kind: str, text: str) -> None:
+        _, perr = discord_post(thread_id, fmt_phase(kind, text))
+        if perr:
+            # Don't fail the pipeline on a status post error — log and move on.
+            summary.setdefault("status_post_errors", []).append(perr)
 
-    # Phase 2 — scan.py.
+    post_phase("inprogress", "Téléchargement Drive…")
+
+    # Phase 2 — scan.py with live progress messages in the thread.
+    posted_phases: set[str] = set()
+
     def on_progress(ev: dict) -> None:
         phase = ev.get("phase")
-        if phase == "drive-poll-start":
-            return  # already shown
-        elif phase == "zip-found":
+        if phase in posted_phases:
+            return
+        posted_phases.add(phase or "")
+        if phase == "zip-found":
             mb = (ev.get("size_bytes") or 0) / 1e6
-            status_lines[:] = [
-                ("done", f"Zip trouvé ({mb:.1f} MB)."),
-                ("inprogress", "Groq Whisper…"),
-            ]
+            post_phase("done", f"Zip Drive trouvé ({mb:.1f} MB).")
+            post_phase("inprogress", "Transcription Groq Whisper…")
         elif phase == "groq-start":
-            status_lines[:] = [
-                ("done", "Zip trouvé."),
-                ("inprogress", "Groq Whisper…"),
-            ]
+            # zip-found already announced groq; only post if zip-found
+            # wasn't seen (unusual).
+            if "zip-found" not in posted_phases:
+                post_phase("inprogress", "Transcription Groq Whisper…")
         elif phase == "writing-raw":
-            status_lines[:] = [
-                ("done", "Transcrit."),
-                ("inprogress", "Push GitHub…"),
-            ]
-        update_status(status_lines)
+            post_phase("done", "Transcription terminée, écriture du fichier…")
 
     rc, scan_result, _ = run_scan(craig_id, on_progress)
 
     if scan_result.get("status") == "error":
-        status_lines[:] = [("error", f"Scan: {scan_result.get('reason')} — {scan_result.get('detail','')[:120]}")]
-        update_status(status_lines)
+        post_phase("error", f"Scan: {scan_result.get('reason')} — "
+                            f"{scan_result.get('detail','')[:200]}")
         summary.update({"phase": "scan-error", "scan": scan_result})
         return summary
 
     if scan_result.get("status") == "skipped" and scan_result.get("reason") == "already-transcribed":
-        # Existing transcript — figure out the path so we can still
-        # ingest + debrief (idempotent re-run).
         as_basename = scan_result.get("as", "")
         transcript_rel = f"raw/transcripts/{as_basename}" if as_basename else None
+        post_phase("done", f"Transcript déjà présent (`{as_basename}`), reprise du pipeline.")
     else:
         transcript_rel = scan_result.get("path")
 
     if not transcript_rel:
-        status_lines[:] = [("error", f"Scan: pas de path retourné — {scan_result.get('reason','')}")]
-        update_status(status_lines)
+        post_phase("error", f"Scan: pas de path retourné — {scan_result.get('reason','')}")
         summary.update({"phase": "scan-no-path", "scan": scan_result})
         return summary
 
     transcript_abs = WIKI_PATH / transcript_rel
     duration_s = int(scan_result.get("duration_s") or 0)
     if not duration_s:
-        # Pull from frontmatter for skipped/race cases.
         try:
             fm, _ = parse_frontmatter(transcript_abs.read_text(encoding="utf-8", errors="replace"))
             duration_s = int(fm.get("duration_s") or 0)
         except Exception:
             duration_s = 0
 
-    status_lines[:] = [("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
-                       ("inprogress", "Push GitHub…")]
-    update_status(status_lines)
+    if scan_result.get("status") != "skipped":
+        post_phase("done", f"Transcrit : `{transcript_rel}` "
+                           f"({duration_s//60}m {duration_s%60}s).")
 
     # Phase 3 — git push transcript.
-    sha, push_err = git_commit_push(WIKI_PATH, [transcript_rel],
-                                    f"raw: capture transcript {transcript_abs.stem}")
+    post_phase("inprogress", "Commit + push GitHub (transcript)…")
+    sha, push_err = git_commit_push(
+        WIKI_PATH, [transcript_rel],
+        f"raw: capture transcript {transcript_abs.stem}",
+    )
     if push_err:
-        status_lines[:] = [("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
-                           ("error", f"Push: {push_err[:120]}")]
-        update_status(status_lines)
+        post_phase("error", f"Push transcript: {push_err[:200]}")
         summary.update({"phase": "push-error", "detail": push_err})
         return summary
     if sha:
         link = github_link(WIKI_PATH, sha)
-        push_text = f"Pushed: [{sha}]({link})." if link.startswith("http") else f"Pushed ({sha})."
+        push_text = f"Pushé : [`{sha}`]({link})." if link.startswith("http") else f"Pushé (`{sha}`)."
     else:
-        push_text = "Push: rien à pusher (déjà sur origin)."
-    status_lines[:] = [("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
-                       ("done", push_text),
-                       ("inprogress", "Ingest wiki…")]
-    update_status(status_lines)
+        push_text = "Push transcript : rien à pusher (déjà sur origin)."
+    post_phase("done", push_text)
 
     # Phase 4 — llm-wiki ingest.
+    post_phase("inprogress", "Ingest llm-wiki (agent loop bufferisé)…")
     ingest = llm_wiki_ingest(transcript_abs)
     summary["ingest"] = ingest
     if ingest["status"] == "committed":
-        ing_text = (f"Wiki: {ingest['n_files']} fichier(s) "
-                    f"({ingest['n_created']} créé(s), {ingest['n_updated']} maj).")
-        status_lines[:] = [
-            ("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
-            ("done", push_text),
-            ("done", ing_text),
-        ]
+        post_phase("done",
+                   f"Wiki ingéré : {ingest['n_files']} fichier(s) "
+                   f"({ingest['n_created']} créé(s), {ingest['n_updated']} maj), "
+                   f"commit `{ingest.get('sha','?')}`.")
     elif ingest["status"] == "no-op":
-        status_lines[:] = [
-            ("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
-            ("done", push_text),
-            ("done", "Wiki: aucune édition proposée."),
-        ]
+        post_phase("done", "Wiki ingest : aucune édition proposée par le LLM.")
     elif ingest["status"] in ("aborted", "llm-error"):
-        status_lines[:] = [
-            ("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
-            ("done", push_text),
-            ("error", f"Ingest aborté ({ingest.get('reason','?')[:100]})."),
-        ]
+        post_phase("error",
+                   f"Ingest aborté ({ingest.get('reason','?')[:200]}). "
+                   f"Transcript reste committé, debrief continue.")
 
-    # Always proceed to debrief even on ingest abort — the transcript is
-    # already committed, debrief generation is decoupled.
+    # Always proceed to debrief even on ingest abort.
     if duration_s and duration_s < MIN_DURATION_S:
-        status_lines.append(("done", f"Recording court (<{MIN_DURATION_S}s), pas de debrief."))
-        update_status(status_lines)
+        post_phase("done", f"Recording court ({duration_s}s < {MIN_DURATION_S}s) — "
+                           f"pas de debrief généré.")
         delete_pending(pending_path)
         summary.update({"phase": "done-short"})
         return summary
 
-    status_lines.append(("inprogress", "Génération debrief…"))
-    update_status(status_lines)
+    post_phase("inprogress", "Génération debrief (OpenRouter)…")
 
     # Phase 5 — debrief JSON.
     DEBRIEFS_DIR.mkdir(parents=True, exist_ok=True)
     debrief_path = DEBRIEFS_DIR / f"{transcript_abs.stem}.json"
     if debrief_path.exists():
-        # Idempotent re-run — debrief already generated, skip generation.
         try:
             debrief_data = json.loads(debrief_path.read_text(encoding="utf-8"))
             schema = json.loads(DEBRIEF_SCHEMA.read_text(encoding="utf-8"))
             errors = list(Draft202012Validator(schema).iter_errors(debrief_data))
             if errors:
-                # Existing file is invalid — regenerate.
                 debrief_path.unlink()
         except Exception:
             try:
@@ -1265,38 +1352,37 @@ def process_pending(pending_path: pathlib.Path) -> dict:
         try:
             schema = json.loads(DEBRIEF_SCHEMA.read_text(encoding="utf-8"))
         except Exception as exc:
-            status_lines[-1] = ("error", f"Schema introuvable: {exc}")
-            update_status(status_lines)
+            post_phase("error", f"Schema debrief introuvable: {exc}")
             summary.update({"phase": "schema-load-error", "detail": str(exc)})
             return summary
         debrief_data, gen_err = generate_debrief(transcript_abs, schema)
         if not debrief_data:
-            status_lines[-1] = ("error", f"Debrief LLM: {gen_err[:120] if gen_err else 'unknown'}")
-            update_status(status_lines)
+            post_phase("error", f"Génération debrief LLM échouée : "
+                                f"{(gen_err or 'unknown')[:200]}")
             summary.update({"phase": "debrief-generation-failed", "detail": gen_err})
-            # Keep pending: transcript is committed, but we want to retry
-            # debrief generation on the next tick.
             return summary
-        debrief_path.write_text(json.dumps(debrief_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        debrief_path.write_text(
+            json.dumps(debrief_data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-    # Phase 6 — debrief.py (POST recap + thread).
+    # Phase 6 — debrief.py (POST recap + thread in #hermes-perso).
     rc, deb_result = run_debrief_py(debrief_path)
     summary["debrief_py"] = deb_result
     if deb_result.get("status") == "posted":
-        thread_id = deb_result.get("thread_id")
-        thread_url = f"https://discord.com/channels/@me/{thread_id}" if thread_id else ""
-        text = f"Debrief posté." if not thread_url else f"Debrief posté: thread `{thread_id}`."
-        status_lines[-1] = ("done", text)
+        deb_thread_id = deb_result.get("thread_id")
+        post_phase("done",
+                   f"Debrief posté dans `#hermes-perso`"
+                   + (f" (thread `{deb_thread_id}`)." if deb_thread_id else "."))
     elif deb_result.get("status") == "skipped":
-        status_lines[-1] = ("done", f"Debrief skipped: {deb_result.get('reason')}.")
+        post_phase("done", f"Debrief skipped : {deb_result.get('reason')}.")
     else:
-        status_lines[-1] = ("error", f"Debrief.py: {deb_result.get('reason','?')}")
-        update_status(status_lines)
-        # Don't delete pending so we can retry on next tick.
+        post_phase("error", f"Debrief.py : {deb_result.get('reason','?')} — "
+                            f"{deb_result.get('detail','')[:200]}")
         summary.update({"phase": "debrief-py-error"})
         return summary
 
-    update_status(status_lines)
+    post_phase("done", "Pipeline terminé.")
     delete_pending(pending_path)
     summary.update({"phase": "done"})
     return summary
