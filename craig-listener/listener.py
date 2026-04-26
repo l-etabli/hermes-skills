@@ -254,44 +254,37 @@ FOLLOWUP_CRON_NAME = "craig-watch-followup"
 
 
 def _followup_cron_prompt(hermes_cli: str) -> str:
+    # The follow-up cron's only job is to drive craig-pipeline/pipeline.py.
+    # That script is the deterministic orchestrator (refetch panel ->
+    # scan.py -> push -> llm-wiki ingest agent loop with guards ->
+    # debrief generation -> debrief.py post -> self-cron-remove). The LLM
+    # does NOT orchestrate any of that — every prior attempt to let it
+    # ended up with skipped pushes, vandalised index.md, or hallucinated
+    # status reports. Keep this prompt minimal and DO NOT re-add steps.
     return f"""\
-Tu es active par un cron tick toutes les 5 min pour suivre les recordings
-Craig en cours de traitement.
+Tu es active par un cron tick toutes les 5 min pour faire avancer les
+recordings Craig pending.
 
-Procedure stricte a chaque tick :
-1. Liste $WIKI_PATH/.craig-pending/*.json (via le shell terminal).
-2. Si la liste est VIDE :
-   - Poste UN message dans le canal $DISCORD_HOME_CHANNEL via
-     POST /channels/<id>/messages : '✅ Suivi craig-watch termine,
-     tous les recordings ont ete traites.'
-   - Recupere le job id de ce cron : `{hermes_cli} cron list` puis
-     grep -B1 le nom `{FOLLOWUP_CRON_NAME}` (l'id est l'hex sur la
-     ligne au-dessus de `Name:`).
-   - Supprime le cron : `{hermes_cli} cron remove <id>`.
-   - Termine. NE PAS continuer ni reactiver d'autre skill.
-3. Sinon (au moins un pending) : active le skill craig-watch et
-   execute sa procedure complete (refetch via Discord API -> si
-   'Recording ended.' detecte -> scan.py -> commit/push wiki ->
-   ingest llm-wiki -> meeting-debrief si processed.duration_s >= 180).
-   IMPORTANT - visibilite : pour chaque pending traite, poste UN
-   message de status dans $CRAIG_EVENTS_CHANNEL_ID (reply au message
-   Craig original via message_reference.message_id = pending.message_id)
-   et EDITE-LE au fil des phases (Recording ended -> Transcrit ->
-   Wiki updated -> Debrief poste). Format detaille dans craig-watch
-   SKILL.md § "Visibilite dans #craig-events". L'utilisateur DOIT voir
-   l'avancement, pas attendre 10 min en aveugle.
+Procedure stricte (UNE SEULE chose a faire) :
 
-Anti-patterns (lecons apprises, NE PAS faire) :
-- N'invente jamais de craig_id, channel_id ou message_id : tout vient
-  de l'API Discord ou des fichiers .craig-pending/.
-- Si un script retourne `error`, surface l'erreur, NE PAS ecrire de
-  pending JSON ni bypass le script toi-meme.
-- Tous les calls REST Discord doivent inclure le header
-  `User-Agent: DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)`
-  (Cloudflare bloque le UA Python par defaut).
-- Politique de dedup d'erreurs (cf. craig-watch SKILL.md) toujours
-  appliquee : pas de spam si la meme erreur revient tick apres tick.
-"""
+1. Lance le script craig-pipeline :
+
+   uv run --with requests --with jsonschema --with pyyaml \\
+       /opt/data/skills-shared/craig-pipeline/pipeline.py
+
+2. Reporte la sortie JSON telle quelle. C'est tout.
+
+NE FAIS RIEN d'autre. NE touche pas a git, NE poste pas de message
+Discord, N'active pas craig-watch / llm-wiki / meeting-debrief.
+Le script s'occupe de TOUT : refetch panel Discord, scan.py,
+commit + push transcript, ingest llm-wiki via agent loop bufferise,
+generation debrief OpenRouter + debrief.py, suppression du cron quand
+.craig-pending/ se vide. Ces taches ont ete sorties du LLM apres bugs
+recurrents (push manquant, vandalisme index.md, status hallucines).
+
+Si le script echoue (rc != 0 ou status=error global), surface la sortie
+JSON et arrete-toi la. NE tente PAS de "rattraper" en faisant les
+operations a la main."""
 
 
 def ensure_followup_cron() -> str:
@@ -315,10 +308,13 @@ def ensure_followup_cron() -> str:
             hermes_cli, "cron", "create",
             "every 5m",
             "--name", FOLLOWUP_CRON_NAME,
-            "--skill", "craig-watch",
-            "--skill", "craig-transcript-record",
-            "--skill", "llm-wiki",
-            "--skill", "meeting-debrief",
+            # craig-pipeline is the only skill the tick LLM needs — it
+            # drives pipeline.py which composes scan.py + debrief.py
+            # internally. craig-watch / llm-wiki / meeting-debrief are
+            # intentionally NOT attached: their presence in the tick's
+            # context tempted the LLM into running them in parallel and
+            # double-orchestrating.
+            "--skill", "craig-pipeline",
             _followup_cron_prompt(hermes_cli),
         ],
         capture_output=True, text=True, timeout=30,

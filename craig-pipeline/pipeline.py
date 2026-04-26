@@ -1,0 +1,1350 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "requests",
+#   "jsonschema",
+#   "pyyaml",
+# ]
+# ///
+"""
+craig-pipeline: deterministic orchestrator for the Craig recording pipeline.
+
+Single entry point. Invoked by the `craig-watch-followup` cron tick — the
+LLM session that fires the cron does ONE thing: subprocess this script
+and report its JSON output. All orchestration (Discord status edits,
+git ops, llm-wiki ingest, debrief generation, debrief.py invocation,
+self-cron-removal) is handled here in code. Only ONE LLM call remains
+in the loop: generation of the debrief JSON via OpenRouter.
+
+Why deterministic: in production the LLM-as-orchestrator was observed
+committing without pushing, silently skipping ingest, vandalizing
+index.md (writing tool-call response chatter into the file body), and
+lying about what it did. Code can't lie about whether it pushed.
+
+For each pending entry in $WIKI_PATH/.craig-pending/*.json:
+  0. Refetch the Craig panel via Discord REST. If "Recording ended."
+     not yet present: silence (no status post), keep pending, continue.
+  1. Post initial status message in CRAIG_EVENTS_CHANNEL_ID (reply to
+     the original Craig panel via message_reference). Edit it through
+     each phase: Drive poll -> Groq -> push -> ingest -> debrief.
+  2. Run craig-transcript-record/scan.py (subprocess), stream its
+     progress[] events to the Discord status edit.
+  3. git add + commit + push the new transcript.
+  4. llm-wiki ingest: agent loop with read_file/list_dir/propose_edit/
+     done tools. Edits are buffered, never applied directly by the LLM.
+     Apply transactionally. Run guards (line-loss >30%, hallucination
+     regex, file >5000 lines, >20 files touched). On guard fail: revert
+     working tree, dump debug, continue (transcript stays committed).
+  5. Generate debrief JSON via OpenRouter (gemini-3-flash-preview),
+     validate against schema.json, write to raw/debriefs/<basename>.json.
+  6. Subprocess meeting-debrief/debrief.py to post the recap + thread.
+  7. Delete the pending JSON.
+
+When .craig-pending/ becomes empty after the loop:
+  - Post one ✅ in DISCORD_HOME_CHANNEL.
+  - Self-remove the craig-watch-followup cron via `hermes cron remove`.
+
+Required env: WIKI_PATH, DISCORD_BOT_TOKEN, CRAIG_EVENTS_CHANNEL_ID,
+DISCORD_HOME_CHANNEL, OPENROUTER_API_KEY.
+Optional env:
+  HERMES_SKILLS_DIR (default /opt/data/skills-shared)
+  HERMES_CLI_PATH (default /opt/hermes/.venv/bin/hermes)
+  LLM_WIKI_SKILL_PATH (default /opt/hermes/skills/research/llm-wiki/SKILL.md)
+  OPENROUTER_MODEL (default google/gemini-3-flash-preview)
+  MEETING_DEBRIEF_MIN_DURATION_S (default 180; 10 in test)
+  PIPELINE_INGEST_MAX_TURNS (default 30)
+  PIPELINE_INGEST_MAX_TOOL_CALLS (default 50)
+
+Output: single JSON object on stdout summarizing the run.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
+
+import requests
+import yaml
+from jsonschema import Draft202012Validator
+
+# ----------------------------- env / paths -----------------------------
+
+REQUIRED_ENV = (
+    "WIKI_PATH",
+    "DISCORD_BOT_TOKEN",
+    "CRAIG_EVENTS_CHANNEL_ID",
+    "DISCORD_HOME_CHANNEL",
+    "OPENROUTER_API_KEY",
+)
+_missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
+if _missing:
+    print(json.dumps({"status": "error", "reason": "missing-env",
+                      "detail": f"missing required env vars: {', '.join(_missing)}",
+                      "missing": _missing}, ensure_ascii=False))
+    sys.exit(2)
+
+WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
+PENDING_DIR = WIKI_PATH / ".craig-pending"
+DEBUG_DIR = WIKI_PATH / ".craig-pipeline-debug"
+TRANSCRIPTS_DIR = WIKI_PATH / "raw" / "transcripts"
+DEBRIEFS_DIR = WIKI_PATH / "raw" / "debriefs"
+
+DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+CRAIG_EVENTS_CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
+DISCORD_HOME_CHANNEL = os.environ["DISCORD_HOME_CHANNEL"]
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+
+SKILLS_ROOT = pathlib.Path(os.environ.get("HERMES_SKILLS_DIR", "/opt/data/skills-shared"))
+SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
+DEBRIEF_PY = SKILLS_ROOT / "meeting-debrief" / "debrief.py"
+DEBRIEF_SCHEMA = SKILLS_ROOT / "meeting-debrief" / "schema.json"
+HERMES_CLI = pathlib.Path(os.environ.get("HERMES_CLI_PATH", "/opt/hermes/.venv/bin/hermes"))
+LLM_WIKI_SKILL_PATH = pathlib.Path(
+    os.environ.get("LLM_WIKI_SKILL_PATH", "/opt/hermes/skills/research/llm-wiki/SKILL.md")
+)
+
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
+MIN_DURATION_S = int(os.environ.get("MEETING_DEBRIEF_MIN_DURATION_S", "180"))
+INGEST_MAX_TURNS = int(os.environ.get("PIPELINE_INGEST_MAX_TURNS", "30"))
+INGEST_MAX_TOOL_CALLS = int(os.environ.get("PIPELINE_INGEST_MAX_TOOL_CALLS", "50"))
+
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_USER_AGENT = "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)"
+OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
+
+FOLLOWUP_CRON_NAME = "craig-watch-followup"
+
+# Hallucination markers we've actually seen the LLM write into wiki
+# pages: tool-call response chatter that should never end up on disk.
+HALLUCINATION_RES = [
+    re.compile(r"File unchanged since last read", re.IGNORECASE),
+    re.compile(r"earlier read_file result", re.IGNORECASE),
+    re.compile(r"response from earlier tool", re.IGNORECASE),
+    re.compile(r"<system-reminder>", re.IGNORECASE),
+    re.compile(r"```tool_call|```tool_result", re.IGNORECASE),
+]
+
+# ----------------------------- discord helpers -----------------------------
+
+def _discord_request(method: str, path: str, **kwargs) -> tuple[dict | None, str | None]:
+    headers = {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "User-Agent": DISCORD_USER_AGENT,
+    }
+    if "json" in kwargs:
+        headers["Content-Type"] = "application/json"
+    headers.update(kwargs.pop("headers", None) or {})
+    try:
+        r = requests.request(method, f"{DISCORD_API}{path}",
+                             headers=headers, timeout=15, **kwargs)
+    except requests.RequestException as exc:
+        return None, f"network: {type(exc).__name__}: {exc}"
+    if not r.ok:
+        return None, f"discord-{r.status_code}: {r.text[:300]}"
+    if r.status_code == 204 or not r.text:
+        return {}, None
+    try:
+        return r.json(), None
+    except ValueError:
+        return None, f"discord-bad-json: {r.text[:200]}"
+
+
+def discord_post(channel_id: str, content: str, reply_to: str | None = None) -> tuple[str | None, str | None]:
+    body: dict = {"content": content[:2000]}
+    if reply_to:
+        # fail_if_not_exists=false so the post still works if Craig's panel
+        # was deleted between listener-time and pipeline-time.
+        body["message_reference"] = {
+            "message_id": reply_to,
+            "fail_if_not_exists": False,
+        }
+        body["allowed_mentions"] = {"replied_user": False}
+    msg, err = _discord_request("POST", f"/channels/{channel_id}/messages", json=body)
+    if err:
+        return None, err
+    return str(msg["id"]), None
+
+
+def discord_edit(channel_id: str, message_id: str, content: str) -> str | None:
+    _, err = _discord_request(
+        "PATCH",
+        f"/channels/{channel_id}/messages/{message_id}",
+        json={"content": content[:2000]},
+    )
+    return err
+
+
+def discord_get_message(channel_id: str, message_id: str) -> tuple[dict | None, str | None]:
+    return _discord_request("GET", f"/channels/{channel_id}/messages/{message_id}")
+
+
+# Copied from craig-listener/listener.py (Components V2 walker). Craig's
+# recording panel uses Discord Components V2 (flags & 32768) and the
+# panel text lives nested in components[].components[].content, not in
+# .content or .embeds — a plain msg["content"] would return empty.
+def extract_message_text(msg: dict) -> str:
+    parts: list[str] = [msg.get("content") or ""]
+    for em in msg.get("embeds") or []:
+        for f in ("title", "description"):
+            v = em.get(f)
+            if v:
+                parts.append(v)
+        for fld in em.get("fields") or []:
+            v = fld.get("value")
+            if v:
+                parts.append(v)
+
+    def walk(node):
+        if isinstance(node, dict):
+            v = node.get("content")
+            if isinstance(v, str) and v:
+                parts.append(v)
+            for child in node.get("components") or []:
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(msg.get("components") or [])
+    return "\n".join(parts)
+
+
+ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
+
+
+# ----------------------------- status renderer -----------------------------
+
+def render_status(date_hhmm: str, lines: list[tuple[str, str]]) -> str:
+    icons = {"done": "✅", "inprogress": "⏳", "error": "⚠️"}
+    out = [f"🎙️ Recording {date_hhmm}"]
+    for kind, txt in lines:
+        out.append(f"{icons.get(kind, '•')} {txt}")
+    return "\n".join(out)
+
+
+def parse_first_seen(pending: dict) -> str:
+    raw = pending.get("first_seen_at") or ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H%M UTC")
+    except Exception:
+        return raw or "?"
+
+
+# ----------------------------- pending I/O -----------------------------
+
+def list_pending() -> list[pathlib.Path]:
+    if not PENDING_DIR.exists():
+        return []
+    return sorted(PENDING_DIR.glob("*.json"))
+
+
+def load_pending(path: pathlib.Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_pending(path: pathlib.Path, data: dict) -> None:
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def delete_pending(path: pathlib.Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+# ----------------------------- scan.py wrapper -----------------------------
+
+def run_scan(craig_id: str, on_progress) -> tuple[int, dict, list[dict]]:
+    """Run scan.py as a subprocess, stream progress events through
+    on_progress(event_dict). Returns (rc, final_result, all_progress)."""
+    if not SCAN_PY.exists():
+        return 1, {"status": "error", "reason": "scan-py-missing",
+                   "detail": f"{SCAN_PY} not found"}, []
+    cmd = [
+        "uv", "run",
+        "--with", "google-auth",
+        "--with", "google-api-python-client",
+        "--with", "requests",
+        str(SCAN_PY),
+        "--craig-id", craig_id,
+    ]
+    progress: list[dict] = []
+    result: dict | None = None
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("status") == "progress":
+            progress.append(obj)
+            try:
+                on_progress(obj)
+            except Exception:
+                pass
+        else:
+            result = obj
+    proc.wait()
+    if result is None:
+        stderr = (proc.stderr.read() if proc.stderr else "")[-500:]
+        return proc.returncode or 1, {
+            "status": "error", "reason": "scan-py-bad-json", "detail": stderr,
+        }, progress
+    return proc.returncode, result, progress
+
+
+# ----------------------------- git ops -----------------------------
+
+def git(repo: pathlib.Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, check=check,
+    )
+
+
+def git_commit_push(repo: pathlib.Path, files: list[str], msg: str) -> tuple[str | None, str | None]:
+    """Stage `files`, commit with msg, push to origin. Returns (sha, err).
+    sha=None and err=None means no-op (nothing to commit)."""
+    try:
+        for f in files:
+            git(repo, "add", "--", f)
+        status = git(repo, "status", "--porcelain")
+        if not status.stdout.strip():
+            return None, None  # no-op
+        git(repo, "commit", "-m", msg)
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+        push = git(repo, "push", check=False)
+        if push.returncode != 0:
+            return None, f"push-failed: {(push.stderr or push.stdout)[:200]}"
+        return head[:8], None
+    except subprocess.CalledProcessError as exc:
+        return None, f"git: {exc.cmd[1:]} -> {exc.stderr[:200]}"
+
+
+def github_link(repo: pathlib.Path, sha: str) -> str:
+    """Best-effort GitHub commit URL from origin remote. Falls back to sha."""
+    try:
+        remote = git(repo, "remote", "get-url", "origin").stdout.strip()
+    except subprocess.CalledProcessError:
+        return sha
+    m = re.match(r"(?:git@github\.com:|https://github\.com/)([^/]+/[^/.]+)(\.git)?$", remote)
+    if not m:
+        return sha
+    return f"https://github.com/{m.group(1)}/commit/{sha}"
+
+
+# ----------------------------- openrouter -----------------------------
+
+def openrouter_chat(messages: list[dict], tools: list[dict] | None = None,
+                    response_format: dict | None = None,
+                    model: str | None = None) -> tuple[dict | None, str | None]:
+    body: dict = {
+        "model": model or OPENROUTER_MODEL,
+        "messages": messages,
+    }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    if response_format:
+        body["response_format"] = response_format
+    try:
+        r = requests.post(
+            OPENROUTER_API,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/l-etabli/hermes-skills",
+                "X-Title": "craig-pipeline",
+            },
+            json=body,
+            timeout=120,
+        )
+    except requests.RequestException as exc:
+        return None, f"network: {type(exc).__name__}: {exc}"
+    if not r.ok:
+        return None, f"openrouter-{r.status_code}: {r.text[:400]}"
+    try:
+        return r.json(), None
+    except ValueError:
+        return None, f"openrouter-bad-json: {r.text[:200]}"
+
+
+# ----------------------------- llm-wiki ingest -----------------------------
+
+INGEST_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file from the wiki vault. Path is wiki-relative.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Wiki-relative path (e.g. 'index.md', 'people/jerome.md')."}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List entries in a wiki directory. Path is wiki-relative.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Wiki-relative directory path. Use '.' for the wiki root."}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_edit",
+            "description": (
+                "Buffer an edit to the wiki. Does NOT touch the filesystem — "
+                "the orchestrator validates and applies all buffered edits "
+                "atomically when you call `done`. Returns 'buffered' or "
+                "'rejected: <reason>'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "append", "replace", "patch"],
+                        "description": (
+                            "create: new file. append: append text to existing file. "
+                            "replace: overwrite full content (rare, use for refactors). "
+                            "patch: find/replace a single substring."
+                        ),
+                    },
+                    "path": {"type": "string", "description": "Wiki-relative path. Cannot be inside raw/ or .craig-*/."},
+                    "content": {
+                        "type": "string",
+                        "description": "Required for create/append/replace. Full content (create/replace) or text to append (append).",
+                    },
+                    "find": {"type": "string", "description": "Required for patch. Exact substring to find."},
+                    "replace_with": {"type": "string", "description": "Required for patch. Replacement text."},
+                },
+                "required": ["action", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "done",
+            "description": "Signal end of ingest session. Pass a short rationale describing what was changed.",
+            "parameters": {
+                "type": "object",
+                "properties": {"rationale": {"type": "string"}},
+                "required": ["rationale"],
+            },
+        },
+    },
+]
+
+
+INGEST_OVERRIDE = """\
+
+---
+
+# Override (orchestrator-injected, mandatory)
+
+Tu n'as PAS access à `write_file`, `git`, `bash` ou shell d'aucune sorte.
+Pour proposer des éditions au vault, utilise EXCLUSIVEMENT l'outil
+`propose_edit` qui buffere ta demande sans toucher au filesystem.
+L'orchestrator validera (guards anti-vandalisme) et appliquera les
+éditions de manière transactionnelle quand tu appelleras `done`.
+
+Outils disponibles : `read_file`, `list_dir`, `propose_edit`, `done`.
+
+Règles strictes :
+- N'écris JAMAIS dans `raw/` (transcripts + debriefs gérés par le code).
+- N'écris JAMAIS de chatter de tool-call, de `<system-reminder>`, ou
+  de paraphrase d'un read_file dans le contenu d'un fichier wiki.
+- Préfère `append`/`patch` à `replace` (replace écrase tout le fichier).
+- Si tu ne sais pas quoi faire, appelle `done` avec un rationale court.
+  Un ingest vide vaut mieux qu'un ingest halluciné.
+- Limite ferme : 30 turns max, 50 tool calls max. Au-delà l'orchestrator
+  coupe court et récupère ton buffer en l'état.
+"""
+
+
+def _is_safe_wiki_path(p: str) -> tuple[pathlib.Path | None, str | None]:
+    """Resolve a user-supplied wiki-relative path. Reject absolute paths,
+    escapes via .., and any path inside raw/ or .craig-*/. Returns
+    (absolute_path, error)."""
+    if not p or not isinstance(p, str):
+        return None, "empty path"
+    if p.startswith("/"):
+        return None, "absolute path not allowed"
+    norm = pathlib.PurePosixPath(p)
+    if any(part == ".." for part in norm.parts):
+        return None, "path escape (..) not allowed"
+    parts = norm.parts
+    if parts and parts[0] in ("raw",):
+        return None, "raw/ is read-only for ingest"
+    if parts and parts[0].startswith(".craig"):
+        return None, ".craig-*/ is runtime state, not wiki content"
+    abs_path = (WIKI_PATH / norm).resolve()
+    try:
+        abs_path.relative_to(WIKI_PATH.resolve())
+    except ValueError:
+        return None, "path resolves outside wiki root"
+    return abs_path, None
+
+
+def _wiki_baseline(wiki: pathlib.Path) -> dict[str, dict]:
+    """sha256 + line-count snapshot for every .md outside raw/ and
+    .craig-*/. Used to compute diffs and enforce line-loss guards."""
+    out: dict[str, dict] = {}
+    for p in wiki.rglob("*.md"):
+        rel = p.relative_to(wiki).as_posix()
+        if rel.startswith("raw/") or rel.startswith(".craig"):
+            continue
+        if "/.git/" in str(p) or rel.startswith(".git/"):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        out[rel] = {
+            "sha": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "lines": text.count("\n") + (0 if text.endswith("\n") or not text else 1),
+        }
+    return out
+
+
+def _line_count(text: str) -> int:
+    if not text:
+        return 0
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
+
+
+def _hallucination_match(text: str) -> str | None:
+    for rx in HALLUCINATION_RES:
+        if rx.search(text):
+            return rx.pattern
+    return None
+
+
+def _read_llm_wiki_skill() -> str:
+    """Best-effort load of the upstream llm-wiki SKILL.md. If unreachable
+    (mount missing, path env wrong) we fall back to a brief built-in
+    description so the agent still has guidance — better an imperfect
+    ingest than crashing the pipeline."""
+    if LLM_WIKI_SKILL_PATH.exists():
+        try:
+            return LLM_WIKI_SKILL_PATH.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    return (
+        "# llm-wiki (fallback brief)\n\n"
+        "Tu maintiens un vault Markdown personnel (Obsidian-style avec "
+        "liens [[X]]). Pour chaque transcript ingéré : ajoute une entrée "
+        "courte dans log.md (date + résumé 1 ligne), met à jour les pages "
+        "people/ et concepts/ mentionnées (ajoute des liens vers le "
+        "transcript), crée de nouvelles pages concepts si pertinent. "
+        "Ne touche PAS à raw/. Préfère append/patch à replace.\n"
+    )
+
+
+def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
+    if name == "read_file":
+        abs_path, err = _is_safe_wiki_path(args.get("path", ""))
+        if err:
+            return {"error": err}
+        if not abs_path or not abs_path.exists():
+            return {"error": "file not found"}
+        if abs_path.is_dir():
+            return {"error": "is a directory; use list_dir"}
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return {"error": f"read failed: {type(exc).__name__}: {exc}"}
+        # Cap content returned to the model — single huge file shouldn't
+        # blow context. 50KB is generous for a wiki page.
+        if len(text) > 50_000:
+            return {"content": text[:50_000], "truncated": True, "total_bytes": len(text)}
+        return {"content": text}
+
+    if name == "list_dir":
+        path = args.get("path", "")
+        if path in (".", ""):
+            abs_path = WIKI_PATH
+        else:
+            abs_path, err = _is_safe_wiki_path(path)
+            if err:
+                return {"error": err}
+        if not abs_path or not abs_path.exists() or not abs_path.is_dir():
+            return {"error": "not a directory"}
+        entries = []
+        for e in sorted(abs_path.iterdir()):
+            rel = e.relative_to(WIKI_PATH).as_posix()
+            if rel.startswith("raw/") or rel.startswith(".craig") or rel.startswith(".git"):
+                continue
+            entries.append({"name": e.name, "type": "dir" if e.is_dir() else "file"})
+        return {"entries": entries}
+
+    if name == "propose_edit":
+        action = args.get("action")
+        path = args.get("path", "")
+        abs_path, err = _is_safe_wiki_path(path)
+        if err:
+            return {"status": "rejected", "reason": err}
+        if not abs_path:
+            return {"status": "rejected", "reason": "bad path"}
+        if action == "create":
+            if abs_path.exists():
+                return {"status": "rejected", "reason": "file already exists; use append/patch"}
+            content = args.get("content", "")
+            if not content.strip():
+                return {"status": "rejected", "reason": "empty content"}
+            buffer.append({"action": "create", "path": path, "content": content})
+            return {"status": "buffered"}
+        if action == "append":
+            if not abs_path.exists():
+                return {"status": "rejected", "reason": "file does not exist; use create"}
+            content = args.get("content", "")
+            if not content.strip():
+                return {"status": "rejected", "reason": "empty content"}
+            buffer.append({"action": "append", "path": path, "content": content})
+            return {"status": "buffered"}
+        if action == "replace":
+            if not abs_path.exists():
+                return {"status": "rejected", "reason": "file does not exist; use create"}
+            content = args.get("content", "")
+            if not content.strip():
+                return {"status": "rejected", "reason": "empty content"}
+            buffer.append({"action": "replace", "path": path, "content": content})
+            return {"status": "buffered"}
+        if action == "patch":
+            if not abs_path.exists():
+                return {"status": "rejected", "reason": "file does not exist"}
+            find = args.get("find", "")
+            replace_with = args.get("replace_with", "")
+            if not find:
+                return {"status": "rejected", "reason": "empty find"}
+            buffer.append({"action": "patch", "path": path, "find": find, "replace_with": replace_with})
+            return {"status": "buffered"}
+        return {"status": "rejected", "reason": f"unknown action: {action}"}
+
+    if name == "done":
+        return {"status": "done"}
+
+    return {"error": f"unknown tool: {name}"}
+
+
+def _agent_loop(transcript_path: pathlib.Path) -> tuple[list[dict], str, str | None]:
+    """Drive the OpenRouter agent loop. Returns (buffer, terminal_reason,
+    rationale). terminal_reason ∈ {'done', 'turn-limit', 'tool-call-limit',
+    'no-tool-calls', 'llm-error'}."""
+    skill_md = _read_llm_wiki_skill()
+    system = skill_md + INGEST_OVERRIDE
+    transcript_rel = transcript_path.relative_to(WIKI_PATH).as_posix()
+    user_prompt = (
+        f"Voici un nouveau transcript à ingérer dans le wiki : `{transcript_rel}`.\n\n"
+        f"1. Lis-le avec `read_file`.\n"
+        f"2. Explore le vault (people/, concepts/, log.md, index.md...) avec "
+        f"`list_dir` et `read_file` pour repérer les pages existantes "
+        f"correspondant aux entités/concepts/personnes mentionnés.\n"
+        f"3. Propose les éditions nécessaires via `propose_edit` : entrée "
+        f"de log, mise à jour de pages personnes/concepts, nouvelles pages "
+        f"concept si pertinent, mise à jour des index/dataview.\n"
+        f"4. Termine avec `done` quand tu as fini, ou immédiatement avec "
+        f"`done` si le transcript ne mérite pas d'ingest (smalltalk, test "
+        f"technique, recording vide).\n"
+    )
+    messages: list[dict] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_prompt},
+    ]
+    buffer: list[dict] = []
+    rationale: str | None = None
+    tool_calls_total = 0
+
+    for turn in range(INGEST_MAX_TURNS):
+        resp, err = openrouter_chat(messages, tools=INGEST_TOOLS)
+        if err:
+            return buffer, "llm-error", err
+        try:
+            choice = resp["choices"][0]
+            assistant = choice["message"]
+        except (KeyError, IndexError, TypeError):
+            return buffer, "llm-error", f"bad-response: {str(resp)[:300]}"
+
+        # Forward the assistant message verbatim — OpenAI/OpenRouter
+        # require the same tool_calls payload to be replayed back
+        # before the matching `tool` messages.
+        messages.append({
+            "role": "assistant",
+            "content": assistant.get("content") or "",
+            "tool_calls": assistant.get("tool_calls") or [],
+        })
+        tool_calls = assistant.get("tool_calls") or []
+        if not tool_calls:
+            return buffer, "no-tool-calls", rationale
+
+        done_called = False
+        for tc in tool_calls:
+            tool_calls_total += 1
+            fn = tc.get("function") or {}
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = _handle_ingest_tool(name, args, buffer)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id", ""),
+                "content": json.dumps(result, ensure_ascii=False)[:8000],
+            })
+            if name == "done":
+                done_called = True
+                rationale = args.get("rationale")
+            if tool_calls_total >= INGEST_MAX_TOOL_CALLS:
+                return buffer, "tool-call-limit", rationale
+
+        if done_called:
+            return buffer, "done", rationale
+
+    return buffer, "turn-limit", rationale
+
+
+def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
+    """Run the agent loop, apply edits transactionally, enforce guards,
+    commit + push on success. Returns a summary dict with keys: status
+    ('committed'|'no-op'|'aborted'|'llm-error'), reason?, sha?, n_files,
+    n_created, n_updated, debug_path?, terminal_reason."""
+    baseline = _wiki_baseline(WIKI_PATH)
+    buffer, terminal, rationale = _agent_loop(transcript_path)
+
+    summary: dict = {
+        "terminal_reason": terminal,
+        "rationale": rationale,
+        "buffered_edits": len(buffer),
+    }
+    if terminal == "llm-error":
+        summary["status"] = "llm-error"
+        summary["reason"] = rationale
+        return summary
+    if not buffer:
+        summary["status"] = "no-op"
+        summary["n_files"] = 0
+        summary["n_created"] = 0
+        summary["n_updated"] = 0
+        return summary
+
+    # Touched-files tally (path -> existed_before? for revert step).
+    touched: dict[str, bool] = {}
+    n_created = 0
+    applied: list[dict] = []
+
+    try:
+        for edit in buffer:
+            path = edit["path"]
+            abs_path, err = _is_safe_wiki_path(path)
+            if err or not abs_path:
+                raise RuntimeError(f"path validation regressed for {path}: {err}")
+            existed_before = abs_path.exists()
+            if path not in touched:
+                touched[path] = existed_before
+            if edit["action"] == "create":
+                if abs_path.exists():
+                    raise RuntimeError(f"create raced: {path} exists")
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                content = edit["content"]
+                if not content.endswith("\n"):
+                    content += "\n"
+                abs_path.write_text(content, encoding="utf-8")
+                n_created += 1 if not existed_before else 0
+                applied.append(edit)
+            elif edit["action"] == "append":
+                with abs_path.open("a", encoding="utf-8") as fh:
+                    sep = "" if (abs_path.read_text(encoding="utf-8", errors="replace").endswith("\n") or abs_path.stat().st_size == 0) else "\n"
+                    fh.write(sep + edit["content"] + ("\n" if not edit["content"].endswith("\n") else ""))
+                applied.append(edit)
+            elif edit["action"] == "replace":
+                content = edit["content"]
+                if not content.endswith("\n"):
+                    content += "\n"
+                abs_path.write_text(content, encoding="utf-8")
+                applied.append(edit)
+            elif edit["action"] == "patch":
+                cur = abs_path.read_text(encoding="utf-8", errors="replace")
+                if edit["find"] not in cur:
+                    raise RuntimeError(f"patch find not in {path}")
+                # Replace only first occurrence — multiple identical
+                # substrings in a wiki page are usually intentional
+                # (links repeated across sections). Forcing the LLM to
+                # disambiguate by enlarging `find` is safer than
+                # silently rewriting all occurrences.
+                new = cur.replace(edit["find"], edit["replace_with"], 1)
+                abs_path.write_text(new, encoding="utf-8")
+                applied.append(edit)
+    except Exception as exc:
+        _revert_touched(touched)
+        debug_path = _dump_debug(buffer, baseline, f"apply-failed: {exc}")
+        summary["status"] = "aborted"
+        summary["reason"] = f"apply-failed: {type(exc).__name__}: {exc}"
+        summary["debug_path"] = debug_path
+        return summary
+
+    # Guards — applied to working tree state.
+    guard_fail = _check_guards(touched, baseline, applied)
+    if guard_fail:
+        _revert_touched(touched)
+        debug_path = _dump_debug(buffer, baseline, guard_fail)
+        summary["status"] = "aborted"
+        summary["reason"] = guard_fail
+        summary["debug_path"] = debug_path
+        return summary
+
+    # Commit + push.
+    files = sorted(touched.keys())
+    basename = transcript_path.stem
+    sha, err = git_commit_push(WIKI_PATH, files, f"wiki: ingest {basename}")
+    if err:
+        # Hard to recover cleanly here — the working tree edits are
+        # legitimate per guards, but couldn't be pushed. Leave them in
+        # the working tree so a human can inspect; the next pipeline
+        # tick won't try to re-ingest because the pending JSON will
+        # be deleted only after the debrief step. Actually — we DO
+        # delete pending after debrief, so partial commits would loop.
+        # Safer: revert and report.
+        _revert_touched(touched)
+        debug_path = _dump_debug(buffer, baseline, f"git-push-failed: {err}")
+        summary["status"] = "aborted"
+        summary["reason"] = err
+        summary["debug_path"] = debug_path
+        return summary
+
+    n_updated = sum(1 for p, existed in touched.items() if existed)
+    n_created_final = sum(1 for p, existed in touched.items() if not existed)
+    summary["status"] = "committed" if sha else "no-op"
+    summary["sha"] = sha
+    summary["n_files"] = len(touched)
+    summary["n_created"] = n_created_final
+    summary["n_updated"] = n_updated
+    return summary
+
+
+def _check_guards(touched: dict[str, bool], baseline: dict[str, dict],
+                  applied: list[dict]) -> str | None:
+    """Returns None if all guards pass, else a short reason string."""
+    if len(touched) > 20:
+        return f"runaway-files: {len(touched)} > 20"
+
+    # Hallucination regex on every inserted-content payload.
+    for edit in applied:
+        haystacks = []
+        if edit["action"] in ("create", "append", "replace"):
+            haystacks.append(edit.get("content") or "")
+        elif edit["action"] == "patch":
+            haystacks.append(edit.get("replace_with") or "")
+        for h in haystacks:
+            hit = _hallucination_match(h)
+            if hit:
+                return f"hallucination-regex: {hit} in edit on {edit['path']}"
+
+    # Per-file checks: line-loss for existing, size cap for new.
+    for path, existed_before in touched.items():
+        abs_path = WIKI_PATH / path
+        if not abs_path.exists():
+            return f"file-vanished: {path}"
+        text = abs_path.read_text(encoding="utf-8", errors="replace")
+        new_lines = _line_count(text)
+        if existed_before:
+            old_lines = baseline.get(path, {}).get("lines", 0)
+            if old_lines > 0 and new_lines < 0.7 * old_lines:
+                return f"line-loss: {path} {old_lines} -> {new_lines}"
+        else:
+            if new_lines > 5000:
+                return f"oversized-new-file: {path} {new_lines} lines"
+    return None
+
+
+def _revert_touched(touched: dict[str, bool]) -> None:
+    """Best-effort revert of working-tree edits. For files that existed
+    before, `git checkout -- <path>` restores the committed version. For
+    files that didn't exist (created during this run), `rm` them."""
+    for path, existed_before in touched.items():
+        abs_path = WIKI_PATH / path
+        try:
+            if existed_before:
+                git(WIKI_PATH, "checkout", "--", path, check=False)
+            else:
+                if abs_path.exists():
+                    abs_path.unlink()
+        except Exception:
+            pass
+
+
+def _dump_debug(buffer: list[dict], baseline: dict[str, dict], reason: str) -> str:
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = DEBUG_DIR / f"{ts}.json"
+    payload = {
+        "reason": reason,
+        "buffered_edits": buffer,
+        "baseline_files": len(baseline),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(path.relative_to(WIKI_PATH))
+
+
+# ----------------------------- debrief generation -----------------------------
+
+def parse_frontmatter(md_text: str) -> tuple[dict, str]:
+    if not md_text.startswith("---\n"):
+        return {}, md_text
+    end = md_text.find("\n---\n", 4)
+    if end == -1:
+        return {}, md_text
+    fm_block = md_text[4:end]
+    body = md_text[end + 5:]
+    try:
+        fm = yaml.safe_load(fm_block) or {}
+    except yaml.YAMLError:
+        fm = {}
+    return fm, body
+
+
+DEBRIEF_SYSTEM = """\
+Tu es un assistant qui transforme un transcript de meeting en un debrief
+JSON STRICT conforme au schéma fourni. Règles absolues :
+
+- Tu te bases EXCLUSIVEMENT sur le contenu du transcript fourni dans le
+  user message. Tu n'inventes RIEN qui ne soit textuellement dans le
+  transcript : pas d'entité, pas de personne, pas d'action, pas de
+  décision, pas de date.
+- Si le transcript ne contient AUCUNE action concrète (smalltalk,
+  brainstorming sans engagement, test technique, recording silencieux),
+  retourne `"action_items": []`. UN debrief vide est meilleur qu'UN
+  debrief halluciné.
+- Le `tldr` doit être 2-5 puces markdown, courtes. Le recap markdown
+  rendu côté Discord (TLDR + decisions + open_questions + actions) doit
+  rester sous ~1800 chars : sois concis.
+- Pour chaque action_item : `id` 1-based unique, `type` ∈ taxonomie du
+  schema, `suggested_action.kind` ∈ enum schema, `target` inféré
+  raisonnablement (préfère un repo plausible owner/repo, un email
+  clair). `confidence` ∈ [0,1], honnête : <0.6 si doute.
+- Réponds UNIQUEMENT par un objet JSON valide, sans ```json fence ni
+  texte autour.
+"""
+
+
+def generate_debrief(transcript_path: pathlib.Path, schema: dict) -> tuple[dict | None, str | None]:
+    md_text = transcript_path.read_text(encoding="utf-8", errors="replace")
+    fm, body = parse_frontmatter(md_text)
+    transcript_rel = transcript_path.relative_to(WIKI_PATH).as_posix()
+    schema_dump = json.dumps(schema, ensure_ascii=False, indent=2)
+    user = (
+        f"Schéma cible (JSON Schema Draft 2020-12) :\n```json\n{schema_dump}\n```\n\n"
+        f"Le champ `transcript_path` doit valoir EXACTEMENT : `{transcript_rel}`.\n\n"
+        f"Transcript à débriefer :\n\n```markdown\n{body[:60_000]}\n```\n"
+    )
+    messages = [
+        {"role": "system", "content": DEBRIEF_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    validator = Draft202012Validator(schema)
+    last_err: str | None = None
+    for attempt in range(3):
+        resp, err = openrouter_chat(
+            messages,
+            response_format={"type": "json_object"},
+        )
+        if err:
+            last_err = err
+            time.sleep(2 * (attempt + 1))
+            continue
+        try:
+            content = resp["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            last_err = f"bad-response: {str(resp)[:300]}"
+            continue
+        # Strip a stray ```json fence if the model adds one despite instructions.
+        text = (content or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            last_err = f"bad-json: {exc}"
+            messages.append({"role": "assistant", "content": content or ""})
+            messages.append({"role": "user", "content": f"Ta réponse n'était pas du JSON valide ({exc}). Réessaie, JSON pur, pas de fence."})
+            continue
+        # Force transcript_path even if model hallucinated a different value.
+        data["transcript_path"] = transcript_rel
+        errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
+        if not errors:
+            return data, None
+        last_err = "; ".join(f"{'/'.join(map(str, e.path)) or '<root>'}: {e.message}" for e in errors[:5])
+        messages.append({"role": "assistant", "content": content or ""})
+        messages.append({"role": "user", "content": f"Ta réponse ne valide pas le schéma : {last_err}. Corrige et renvoie un JSON conforme."})
+    return None, last_err or "unknown"
+
+
+def run_debrief_py(debrief_path: pathlib.Path) -> tuple[int, dict]:
+    if not DEBRIEF_PY.exists():
+        return 1, {"status": "error", "reason": "debrief-py-missing", "detail": str(DEBRIEF_PY)}
+    cmd = [
+        "uv", "run",
+        "--with", "requests",
+        "--with", "jsonschema",
+        "--with", "pyyaml",
+        str(DEBRIEF_PY),
+        "--debrief-path", str(debrief_path.relative_to(WIKI_PATH))
+            if debrief_path.is_relative_to(WIKI_PATH) else str(debrief_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    last_json: dict | None = None
+    for ln in (proc.stdout or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            last_json = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+    if last_json is None:
+        return proc.returncode or 1, {
+            "status": "error", "reason": "debrief-py-bad-json",
+            "detail": (proc.stdout + proc.stderr)[-500:],
+        }
+    return proc.returncode, last_json
+
+
+# ----------------------------- self-cron removal -----------------------------
+
+def maybe_self_delete_cron() -> dict:
+    if list_pending():
+        return {"status": "skipped", "reason": "pending-not-empty"}
+    msg = "✅ Suivi craig-watch terminé, tous les recordings ont été traités."
+    msg_id, err = discord_post(DISCORD_HOME_CHANNEL, msg)
+    notif = {"posted_message_id": msg_id, "post_error": err}
+
+    if not HERMES_CLI.exists():
+        return {**notif, "status": "skipped", "reason": f"hermes-cli-missing: {HERMES_CLI}"}
+    list_proc = subprocess.run([str(HERMES_CLI), "cron", "list"], capture_output=True, text=True, timeout=15)
+    job_id: str | None = None
+    # `hermes cron list` prints blocks like:
+    #   <hex job id>
+    #   Name: craig-watch-followup
+    #   ...
+    # We grab the line immediately above `Name: <FOLLOWUP_CRON_NAME>`.
+    lines = list_proc.stdout.splitlines()
+    for i, line in enumerate(lines):
+        if FOLLOWUP_CRON_NAME in line and "Name" in line:
+            for j in range(i - 1, max(-1, i - 5), -1):
+                cand = lines[j].strip()
+                if re.fullmatch(r"[0-9a-fA-F-]{6,}", cand):
+                    job_id = cand
+                    break
+            if job_id:
+                break
+    if not job_id:
+        return {**notif, "status": "no-cron-found", "list_stdout": list_proc.stdout[-300:]}
+
+    rm = subprocess.run([str(HERMES_CLI), "cron", "remove", job_id],
+                        capture_output=True, text=True, timeout=15)
+    if rm.returncode != 0:
+        return {**notif, "status": "remove-failed",
+                "detail": (rm.stderr or rm.stdout)[:200], "job_id": job_id}
+    return {**notif, "status": "removed", "job_id": job_id}
+
+
+# ----------------------------- per-pending pipeline -----------------------------
+
+def process_pending(pending_path: pathlib.Path) -> dict:
+    pending = load_pending(pending_path)
+    craig_id = pending.get("craig_id") or pending_path.stem
+    channel_id = pending.get("channel_id") or CRAIG_EVENTS_CHANNEL_ID
+    panel_id = pending.get("message_id")
+    date_hhmm = parse_first_seen(pending)
+
+    summary: dict = {"craig_id": craig_id, "phase": "start"}
+
+    # Phase 0 — refetch panel.
+    if panel_id:
+        panel, err = discord_get_message(channel_id, panel_id)
+        if err:
+            # Could be 404 (panel deleted) or transient. Don't post status,
+            # just bubble up — keep the pending so a human can decide.
+            summary.update({"phase": "panel-refetch-failed", "detail": err})
+            return summary
+        body = extract_message_text(panel or {})
+        if not ENDED_RE.search(body):
+            summary.update({"phase": "still-recording"})
+            return summary
+    # If panel_id missing (manual pending), skip the refetch; assume ended.
+
+    # Phase 1 — initial status post.
+    status_lines: list[tuple[str, str]] = [("inprogress", "Téléchargement Drive…")]
+    status_msg_id = pending.get("pipeline_status_message_id")
+    if status_msg_id:
+        # Resume: edit existing status message.
+        edit_err = discord_edit(CRAIG_EVENTS_CHANNEL_ID, status_msg_id,
+                                render_status(date_hhmm, status_lines))
+        if edit_err:
+            # Message was deleted? Re-post and update pending.
+            status_msg_id = None
+    if not status_msg_id:
+        new_id, err = discord_post(
+            CRAIG_EVENTS_CHANNEL_ID,
+            render_status(date_hhmm, status_lines),
+            reply_to=panel_id,
+        )
+        if err:
+            summary.update({"phase": "status-post-failed", "detail": err})
+            return summary
+        status_msg_id = new_id
+        pending["pipeline_status_message_id"] = status_msg_id
+        save_pending(pending_path, pending)
+
+    def update_status(lines: list[tuple[str, str]]) -> None:
+        discord_edit(CRAIG_EVENTS_CHANNEL_ID, status_msg_id,  # type: ignore[arg-type]
+                     render_status(date_hhmm, lines))
+
+    # Phase 2 — scan.py.
+    def on_progress(ev: dict) -> None:
+        phase = ev.get("phase")
+        if phase == "drive-poll-start":
+            return  # already shown
+        elif phase == "zip-found":
+            mb = (ev.get("size_bytes") or 0) / 1e6
+            status_lines[:] = [
+                ("done", f"Zip trouvé ({mb:.1f} MB)."),
+                ("inprogress", "Groq Whisper…"),
+            ]
+        elif phase == "groq-start":
+            status_lines[:] = [
+                ("done", "Zip trouvé."),
+                ("inprogress", "Groq Whisper…"),
+            ]
+        elif phase == "writing-raw":
+            status_lines[:] = [
+                ("done", "Transcrit."),
+                ("inprogress", "Push GitHub…"),
+            ]
+        update_status(status_lines)
+
+    rc, scan_result, _ = run_scan(craig_id, on_progress)
+
+    if scan_result.get("status") == "error":
+        status_lines[:] = [("error", f"Scan: {scan_result.get('reason')} — {scan_result.get('detail','')[:120]}")]
+        update_status(status_lines)
+        summary.update({"phase": "scan-error", "scan": scan_result})
+        return summary
+
+    if scan_result.get("status") == "skipped" and scan_result.get("reason") == "already-transcribed":
+        # Existing transcript — figure out the path so we can still
+        # ingest + debrief (idempotent re-run).
+        as_basename = scan_result.get("as", "")
+        transcript_rel = f"raw/transcripts/{as_basename}" if as_basename else None
+    else:
+        transcript_rel = scan_result.get("path")
+
+    if not transcript_rel:
+        status_lines[:] = [("error", f"Scan: pas de path retourné — {scan_result.get('reason','')}")]
+        update_status(status_lines)
+        summary.update({"phase": "scan-no-path", "scan": scan_result})
+        return summary
+
+    transcript_abs = WIKI_PATH / transcript_rel
+    duration_s = int(scan_result.get("duration_s") or 0)
+    if not duration_s:
+        # Pull from frontmatter for skipped/race cases.
+        try:
+            fm, _ = parse_frontmatter(transcript_abs.read_text(encoding="utf-8", errors="replace"))
+            duration_s = int(fm.get("duration_s") or 0)
+        except Exception:
+            duration_s = 0
+
+    status_lines[:] = [("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
+                       ("inprogress", "Push GitHub…")]
+    update_status(status_lines)
+
+    # Phase 3 — git push transcript.
+    sha, push_err = git_commit_push(WIKI_PATH, [transcript_rel],
+                                    f"raw: capture transcript {transcript_abs.stem}")
+    if push_err:
+        status_lines[:] = [("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
+                           ("error", f"Push: {push_err[:120]}")]
+        update_status(status_lines)
+        summary.update({"phase": "push-error", "detail": push_err})
+        return summary
+    if sha:
+        link = github_link(WIKI_PATH, sha)
+        push_text = f"Pushed: [{sha}]({link})." if link.startswith("http") else f"Pushed ({sha})."
+    else:
+        push_text = "Push: rien à pusher (déjà sur origin)."
+    status_lines[:] = [("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
+                       ("done", push_text),
+                       ("inprogress", "Ingest wiki…")]
+    update_status(status_lines)
+
+    # Phase 4 — llm-wiki ingest.
+    ingest = llm_wiki_ingest(transcript_abs)
+    summary["ingest"] = ingest
+    if ingest["status"] == "committed":
+        ing_text = (f"Wiki: {ingest['n_files']} fichier(s) "
+                    f"({ingest['n_created']} créé(s), {ingest['n_updated']} maj).")
+        status_lines[:] = [
+            ("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
+            ("done", push_text),
+            ("done", ing_text),
+        ]
+    elif ingest["status"] == "no-op":
+        status_lines[:] = [
+            ("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
+            ("done", push_text),
+            ("done", "Wiki: aucune édition proposée."),
+        ]
+    elif ingest["status"] in ("aborted", "llm-error"):
+        status_lines[:] = [
+            ("done", f"Transcrit ({duration_s//60}m {duration_s%60}s)."),
+            ("done", push_text),
+            ("error", f"Ingest aborté ({ingest.get('reason','?')[:100]})."),
+        ]
+
+    # Always proceed to debrief even on ingest abort — the transcript is
+    # already committed, debrief generation is decoupled.
+    if duration_s and duration_s < MIN_DURATION_S:
+        status_lines.append(("done", f"Recording court (<{MIN_DURATION_S}s), pas de debrief."))
+        update_status(status_lines)
+        delete_pending(pending_path)
+        summary.update({"phase": "done-short"})
+        return summary
+
+    status_lines.append(("inprogress", "Génération debrief…"))
+    update_status(status_lines)
+
+    # Phase 5 — debrief JSON.
+    DEBRIEFS_DIR.mkdir(parents=True, exist_ok=True)
+    debrief_path = DEBRIEFS_DIR / f"{transcript_abs.stem}.json"
+    if debrief_path.exists():
+        # Idempotent re-run — debrief already generated, skip generation.
+        try:
+            debrief_data = json.loads(debrief_path.read_text(encoding="utf-8"))
+            schema = json.loads(DEBRIEF_SCHEMA.read_text(encoding="utf-8"))
+            errors = list(Draft202012Validator(schema).iter_errors(debrief_data))
+            if errors:
+                # Existing file is invalid — regenerate.
+                debrief_path.unlink()
+        except Exception:
+            try:
+                debrief_path.unlink()
+            except OSError:
+                pass
+
+    if not debrief_path.exists():
+        try:
+            schema = json.loads(DEBRIEF_SCHEMA.read_text(encoding="utf-8"))
+        except Exception as exc:
+            status_lines[-1] = ("error", f"Schema introuvable: {exc}")
+            update_status(status_lines)
+            summary.update({"phase": "schema-load-error", "detail": str(exc)})
+            return summary
+        debrief_data, gen_err = generate_debrief(transcript_abs, schema)
+        if not debrief_data:
+            status_lines[-1] = ("error", f"Debrief LLM: {gen_err[:120] if gen_err else 'unknown'}")
+            update_status(status_lines)
+            summary.update({"phase": "debrief-generation-failed", "detail": gen_err})
+            # Keep pending: transcript is committed, but we want to retry
+            # debrief generation on the next tick.
+            return summary
+        debrief_path.write_text(json.dumps(debrief_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Phase 6 — debrief.py (POST recap + thread).
+    rc, deb_result = run_debrief_py(debrief_path)
+    summary["debrief_py"] = deb_result
+    if deb_result.get("status") == "posted":
+        thread_id = deb_result.get("thread_id")
+        thread_url = f"https://discord.com/channels/@me/{thread_id}" if thread_id else ""
+        text = f"Debrief posté." if not thread_url else f"Debrief posté: thread `{thread_id}`."
+        status_lines[-1] = ("done", text)
+    elif deb_result.get("status") == "skipped":
+        status_lines[-1] = ("done", f"Debrief skipped: {deb_result.get('reason')}.")
+    else:
+        status_lines[-1] = ("error", f"Debrief.py: {deb_result.get('reason','?')}")
+        update_status(status_lines)
+        # Don't delete pending so we can retry on next tick.
+        summary.update({"phase": "debrief-py-error"})
+        return summary
+
+    update_status(status_lines)
+    delete_pending(pending_path)
+    summary.update({"phase": "done"})
+    return summary
+
+
+# ----------------------------- main -----------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--craig-id", help="Process only this craig_id (debug).")
+    args = ap.parse_args()
+
+    pendings = list_pending()
+    if args.craig_id:
+        pendings = [p for p in pendings if p.stem == args.craig_id]
+
+    out_summaries: list[dict] = []
+    for p in pendings:
+        try:
+            out_summaries.append(process_pending(p))
+        except Exception as exc:
+            out_summaries.append({
+                "craig_id": p.stem,
+                "phase": "exception",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc()[-1000:],
+            })
+
+    cron_action = maybe_self_delete_cron() if not args.craig_id else {"status": "skipped", "reason": "debug-mode"}
+
+    print(json.dumps({
+        "status": "ok",
+        "processed_count": len(out_summaries),
+        "summaries": out_summaries,
+        "cron_action": cron_action,
+    }, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(json.dumps({
+            "status": "error", "reason": "unexpected",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc()[-1000:],
+        }, ensure_ascii=False))
+        sys.exit(1)

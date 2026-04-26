@@ -41,19 +41,20 @@ required_environment_variables:
 
 # Craig Watch
 
+> ⚠️ **User-driven only / fallback @mention.** Depuis Phase 1 du pipeline déterministe (avril 2026), le cron `craig-watch-followup` invoque `craig-pipeline` (script Python orchestrateur), PAS ce skill. Ce skill `craig-watch` reste utile uniquement pour : (a) une commande user manuelle (« où en est le recording de tout à l'heure ? »), (b) un fallback de debug si `pipeline.py` est cassé et qu'on veut réinvoker `watch.py` à la main. Pour le flow normal cron, voir `craig-pipeline/SKILL.md`.
+
 Cron qui fait le pont entre la phase « recording en cours » (capturée par `craig-listener`) et la phase « transcription » (gérée par `craig-transcript-record`). Comble le trou laissé par l'absence de `on_message_edit` dans Hermes.
 
 ## Pourquoi ce skill existe
 
-Craig édite **le même** message Discord pour passer de `🔴 Recording...` à `Recording ended.` (même `message_id`). Hermes upstream ne supporte pas `on_message_edit` → on ne peut pas écouter la transition en event-driven. Ce skill polle la transition via l'API Discord REST, à intervalle régulier (5 min).
+Craig édite **le même** message Discord pour passer de `🔴 Recording...` à `Recording ended.` (même `message_id`). Hermes upstream ne supporte pas `on_message_edit` → on ne peut pas écouter la transition en event-driven. Ce skill polle la transition via l'API Discord REST.
 
 ## When to Use
 
-**Activé uniquement par cron** (config Hermes), jamais par un message utilisateur. Le cron passe un prompt générique du genre « active craig-watch et fais ce qu'il dit ».
+**Mode normal : NON, n'invoque pas ce skill.** Le cron `craig-watch-followup` invoque `craig-pipeline` (orchestrateur déterministe Python). Si tu vois ce skill mentionné dans une discussion utilisateur :
 
-Si tu vois ce skill mentionné dans une discussion utilisateur : c'est probablement une demande de status (« où en est la transcription du recording de tout à l'heure ? »). Dans ce cas :
-- `ls $WIKI_PATH/.craig-pending/` pour voir ce qui est en vol.
-- Pas besoin d'invoquer le script juste pour ça.
+- Demande de status (« où en est la transcription du recording de tout à l'heure ? ») : `ls $WIKI_PATH/.craig-pending/` pour voir ce qui est en vol. Pas besoin d'invoquer le script.
+- Fallback debug si `craig-pipeline/pipeline.py` est cassé et que l'utilisateur demande explicitement de relancer `watch.py` à la main : suis la procédure ci-dessous.
 
 ## Procedure (pour le run cron)
 
@@ -201,78 +202,9 @@ Le script garde les pending entries en cas d'erreur transitoire — le tick suiv
 
 ## Cron config (côté Hermes)
 
-**Pas de cron permanent à provisionner.** Le cron `craig-watch-followup` est créé **dynamiquement** par `craig-listener/listener.py` (subprocess `hermes cron create`) à chaque nouveau recording, et **s'auto-supprime** quand `.craig-pending/` se vide. Voir § « Mode followup cron » ci-dessous.
+**Pas de cron permanent à provisionner.** Le cron `craig-watch-followup` est créé **dynamiquement** par `craig-listener/listener.py` (subprocess `hermes cron create`) à chaque nouveau recording, et **s'auto-supprime** quand `.craig-pending/` se vide. Depuis Phase 1 (avril 2026), le cron est attaché au skill `craig-pipeline` (orchestrateur déterministe), pas à `craig-watch` — voir `craig-pipeline/SKILL.md` pour le flow complet.
 
 Cadence 5 min : la latence end-to-end est dominée par le cook+upload Craig (1-15 min), donc tick plus fréquent ne change rien.
-
-## Mode followup cron (auto-créé, auto-supprimé)
-
-Quand tu es invoqué dans le contexte du cron `craig-watch-followup` (vs. à la main par un user), comportement légèrement différent :
-
-### Tick handling
-
-À chaque tick (every 5m) :
-
-1. **Liste `$WIKI_PATH/.craig-pending/*.json`.**
-2. **Si vide** (tout a été processed/skipped/expired depuis le dernier tick) :
-   - Poste **un seul** message dans `$DISCORD_HOME_CHANNEL` : `✅ Suivi craig-watch terminé, tous les recordings ont été traités.`
-   - Récupère ton propre `job_id` via `/opt/hermes/.venv/bin/hermes cron list` (regarde la ligne hex au-dessus de `Name: craig-watch-followup`).
-   - Supprime-toi : `/opt/hermes/.venv/bin/hermes cron remove <job_id>`.
-   - Termine. **Ne pas continuer**, ne pas réactiver d'autre skill.
-3. **Sinon** (au moins un pending) : exécute la **Procedure** standard ci-dessus (run watch.py → commit/push/ingest pour processed → meeting-debrief si `duration_s ≥ 180`), avec la **visibilité** ci-dessous.
-
-### Visibilité dans `#craig-events` (CRITIQUE)
-
-L'utilisateur a passé du temps à parler dans Craig — il veut voir où en est le traitement, pas juste recevoir le débrief final 10 min plus tard sans rien entre les deux. **Pas de silence pendant que tu bosses.**
-
-Pour chaque pending entry traitée dans le tick, poste UN message de status dans `$CRAIG_EVENTS_CHANNEL_ID` (idéalement en reply au message Craig original via `message_reference.message_id` = `pending.message_id`), puis **édite-le au fur et à mesure** des phases. Format suggéré :
-
-```
-🎙️ <craig_id>
-⏳ Recording en attente de fin (Craig pas encore "ended").
-```
-
-→ devient, quand tu detectes "Recording ended." :
-
-```
-🎙️ <craig_id>
-✅ Recording terminé. ⏳ Téléchargement Drive + transcription Groq…
-```
-
-→ devient, après scan.py `processed` :
-
-```
-🎙️ <craig_id>
-✅ Recording terminé.
-✅ Transcrit (<duration> min, <name>.flac).
-⏳ Ingest llm-wiki…
-```
-
-→ devient, après ingest :
-
-```
-🎙️ <craig_id>
-✅ Recording terminé.
-✅ Transcrit (<duration> min).
-✅ Wiki updaté (N pages : [[a]], [[b]]).
-⏳ Génération du debrief…
-```
-
-→ devient, après debrief posté :
-
-```
-🎙️ <craig_id>
-✅ Recording terminé.
-✅ Transcrit.
-✅ Wiki updaté.
-✅ Debrief posté dans #hermes-perso.
-```
-
-Si erreur à une phase : remplace l'⏳ par ⚠️ + raison brève. La politique de dedup d'erreurs (§ ci-dessous) reste appliquée pour ne pas spammer si l'erreur persiste.
-
-**Une seule** ligne `⏳` à la fois (la phase courante). Les phases passées restent en ✅. C'est plus parlant qu'un mur de logs.
-
-Le message de fin (debrief posté) reste tel quel, pas besoin de l'effacer ni de poster un récap supplémentaire dans `#craig-events`.
 
 ## Pitfalls
 
