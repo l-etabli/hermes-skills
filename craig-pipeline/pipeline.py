@@ -197,11 +197,15 @@ def discord_get_message(channel_id: str, message_id: str) -> tuple[dict | None, 
 
 
 def discord_create_thread(channel_id: str, message_id: str, name: str) -> tuple[str | None, str | None]:
-    """Open a thread anchored on `message_id`. Returns (thread_id, err)."""
+    """Open a thread anchored on `message_id`. Returns (thread_id, err).
+    auto_archive_duration matches the channel-default (60 min) so our
+    fallback threads behave like the Hermes auto-threads — short
+    archive window, anything older than 1h after pipeline completion
+    is closed by Discord automatically."""
     msg, err = _discord_request(
         "POST",
         f"/channels/{channel_id}/messages/{message_id}/threads",
-        json={"name": name[:100], "auto_archive_duration": 1440},
+        json={"name": name[:100], "auto_archive_duration": 60},
     )
     if err:
         return None, err
