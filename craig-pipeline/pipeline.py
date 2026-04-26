@@ -229,34 +229,49 @@ def find_existing_auto_thread(channel_id: str, craig_id: str,
     to the listener's earlier output instead of spawning a parallel
     "Recording <date>" thread.
 
-    Walks active threads first; if none match, walks recently-archived
-    too (cheap, the channel is low-volume). Returns thread_id or None."""
+    For threads created from a message
+    (POST /channels/{cid}/messages/{mid}/threads), Discord makes
+    `thread.id == mid` — the thread snowflake equals the anchored
+    message id. We exploit that to walk active + recent archived
+    threads, fetch the message at thread.id, and match `craig_id`
+    against its rendered body. (Earlier I matched on `parent_id`,
+    which is actually the parent CHANNEL, not the message — that's
+    why the prior test fell through to the create-our-own branch
+    even though the auto-thread existed.)
+
+    Returns thread_id or None."""
     targets = []
     resp, err = _discord_request("GET", f"/channels/{channel_id}/threads/active")
     if not err and resp:
         targets.extend(resp.get("threads") or [])
     # auto_archive on Hermes-created threads is short — also peek at
-    # archived public threads (paginated by Discord, single page is fine).
+    # recently archived public threads (single page is fine, channel
+    # volume is low).
     resp, err = _discord_request("GET", f"/channels/{channel_id}/threads/archived/public?limit=20")
     if not err and resp:
         targets.extend(resp.get("threads") or [])
 
+    seen: set[str] = set()
     for t in targets:
-        parent_id = t.get("parent_id")
-        if not parent_id:
+        anchor_msg_id = t.get("id")
+        if not anchor_msg_id or anchor_msg_id in seen:
             continue
-        # Fast check: thread anchored directly on Craig's panel.
-        if panel_id and str(parent_id) == str(panel_id):
-            return str(t["id"])
-        # General check: fetch the parent message and look for craig_id
-        # in its body. Catches the listener-response case (Hermes
-        # auto_thread anchors on the bot's reply, not Craig's panel).
-        msg, merr = _discord_request("GET", f"/channels/{channel_id}/messages/{parent_id}")
+        seen.add(anchor_msg_id)
+
+        # Fast path: thread anchored directly on Craig's panel.
+        if panel_id and str(anchor_msg_id) == str(panel_id):
+            return str(anchor_msg_id)
+
+        msg, merr = _discord_request(
+            "GET", f"/channels/{channel_id}/messages/{anchor_msg_id}",
+        )
         if merr or not msg:
+            # Forum-style thread with no anchor message, deleted
+            # message, etc — skip.
             continue
         body = extract_message_text(msg)
         if craig_id and craig_id in body:
-            return str(t["id"])
+            return str(anchor_msg_id)
     return None
 
 
