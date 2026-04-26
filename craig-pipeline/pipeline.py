@@ -330,9 +330,23 @@ def run_scan(craig_id: str, on_progress) -> tuple[int, dict, list[dict]]:
 
 # ----------------------------- git ops -----------------------------
 
+GIT_AUTHOR_NAME = os.environ.get("HERMES_GIT_AUTHOR_NAME", "Hermes Pipeline")
+GIT_AUTHOR_EMAIL = os.environ.get("HERMES_GIT_AUTHOR_EMAIL", "hermes-pipeline@l-etabli.local")
+
+
 def git(repo: pathlib.Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    # Force author identity inline so the script works in any subshell,
+    # without depending on `git config --global user.email/user.name`
+    # being set in the sandbox. Hermes spawns terminal sandboxes
+    # without a persistent global git config, and the previous tick's
+    # success was an artefact of the LLM session having configured it
+    # ad-hoc — not something we can rely on.
+    config_args = (
+        "-c", f"user.name={GIT_AUTHOR_NAME}",
+        "-c", f"user.email={GIT_AUTHOR_EMAIL}",
+    )
     return subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "-C", str(repo), *config_args, *args],
         capture_output=True, text=True, check=check,
     )
 
@@ -370,22 +384,23 @@ def _push_url_with_token(repo: pathlib.Path, token: str) -> str | None:
 
 
 def git_commit_push(repo: pathlib.Path, files: list[str], msg: str) -> tuple[str | None, str | None]:
-    """Stage `files`, commit with msg, push to origin. Returns (sha, err).
-    sha=None and err=None means no-op (nothing to commit)."""
+    """Stage `files`, commit with msg if there's anything new, then push.
+    The push runs unconditionally because a previous tick may have
+    committed locally but failed to push (e.g. the original push-fail
+    we just fixed left an unpushed commit on local main); skipping push
+    on `nothing to commit` would leave that orphan forever.
+
+    Returns (sha, err). sha is the new commit's short hash on commit,
+    or None if commit was a no-op AND the push was a no-op."""
     try:
         for f in files:
             git(repo, "add", "--", f)
         status = git(repo, "status", "--porcelain")
-        if not status.stdout.strip():
-            return None, None  # no-op
-        git(repo, "commit", "-m", msg)
-        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+        new_commit = False
+        if status.stdout.strip():
+            git(repo, "commit", "-m", msg)
+            new_commit = True
 
-        # Resolve a push URL with the GitHub App installation token
-        # embedded inline. If we let git fall back to the bare https
-        # remote, it tries to read a credential helper / prompt for a
-        # username and dies with `No such device or address` on the
-        # headless container.
         token = _read_github_token()
         if not token:
             return None, "push-no-token: GITHUB_TOKEN absent from /opt/data/.env"
@@ -393,17 +408,20 @@ def git_commit_push(repo: pathlib.Path, files: list[str], msg: str) -> tuple[str
         if not push_url:
             return None, "push-bad-remote: origin is not an https://github.com/... URL"
 
-        # Pass the URL via stdin-friendly arg form. Branch is HEAD ->
-        # whatever upstream is configured (origin/main here).
         push = subprocess.run(
             ["git", "-C", str(repo), "push", push_url, "HEAD"],
             capture_output=True, text=True,
         )
         if push.returncode != 0:
-            # Scrub the token if it ever leaks into stderr (shouldn't,
-            # but git can echo URLs in some failure modes).
             scrubbed = (push.stderr or push.stdout).replace(token, "***")[:200]
             return None, f"push-failed: {scrubbed}"
+
+        if not new_commit:
+            # Nothing changed in this call AND push was up-to-date → no-op.
+            up_to_date = "Everything up-to-date" in (push.stderr or "") or not (push.stderr or "").strip()
+            if up_to_date:
+                return None, None
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
         return head[:8], None
     except subprocess.CalledProcessError as exc:
         return None, f"git: {exc.cmd[1:]} -> {exc.stderr[:200]}"
