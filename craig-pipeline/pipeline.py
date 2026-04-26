@@ -229,25 +229,31 @@ def find_existing_auto_thread(channel_id: str, craig_id: str,
     to the listener's earlier output instead of spawning a parallel
     "Recording <date>" thread.
 
-    For threads created from a message
-    (POST /channels/{cid}/messages/{mid}/threads), Discord makes
-    `thread.id == mid` — the thread snowflake equals the anchored
-    message id. We exploit that to walk active + recent archived
-    threads, fetch the message at thread.id, and match `craig_id`
-    against its rendered body. (Earlier I matched on `parent_id`,
-    which is actually the parent CHANNEL, not the message — that's
-    why the prior test fell through to the create-our-own branch
-    even though the auto-thread existed.)
+    Active threads must be listed via the guild-level endpoint
+    `/guilds/{gid}/threads/active` — Discord's `/channels/{cid}/threads/
+    active` does NOT exist (returns 404, observed 2026-04-26 — every
+    earlier reuse attempt fell through to the create-our-own branch
+    because of this 404). We resolve guild_id by GETting the channel
+    once, then filter the guild's active threads by parent_id.
+    Archived threads keep the channel-level endpoint, which is real.
 
-    Returns thread_id or None."""
-    targets = []
-    resp, err = _discord_request("GET", f"/channels/{channel_id}/threads/active")
-    if not err and resp:
-        targets.extend(resp.get("threads") or [])
-    # auto_archive on Hermes-created threads is short — also peek at
-    # recently archived public threads (single page is fine, channel
-    # volume is low).
-    resp, err = _discord_request("GET", f"/channels/{channel_id}/threads/archived/public?limit=20")
+    For threads created from a message Discord guarantees
+    `thread.id == message.id`. Walk candidates, fetch the message at
+    `thread.id`, match `craig_id` against its rendered body."""
+    targets: list[dict] = []
+
+    ch_obj, err = _discord_request("GET", f"/channels/{channel_id}")
+    guild_id = (ch_obj or {}).get("guild_id") if not err else None
+    if guild_id:
+        resp, err = _discord_request("GET", f"/guilds/{guild_id}/threads/active")
+        if not err and resp:
+            for t in resp.get("threads", []):
+                if str(t.get("parent_id")) == str(channel_id):
+                    targets.append(t)
+
+    resp, err = _discord_request(
+        "GET", f"/channels/{channel_id}/threads/archived/public?limit=20",
+    )
     if not err and resp:
         targets.extend(resp.get("threads") or [])
 
@@ -258,7 +264,6 @@ def find_existing_auto_thread(channel_id: str, craig_id: str,
             continue
         seen.add(anchor_msg_id)
 
-        # Fast path: thread anchored directly on Craig's panel.
         if panel_id and str(anchor_msg_id) == str(panel_id):
             return str(anchor_msg_id)
 
@@ -266,8 +271,6 @@ def find_existing_auto_thread(channel_id: str, craig_id: str,
             "GET", f"/channels/{channel_id}/messages/{anchor_msg_id}",
         )
         if merr or not msg:
-            # Forum-style thread with no anchor message, deleted
-            # message, etc — skip.
             continue
         body = extract_message_text(msg)
         if craig_id and craig_id in body:
