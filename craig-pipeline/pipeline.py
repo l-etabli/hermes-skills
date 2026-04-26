@@ -208,6 +208,58 @@ def discord_create_thread(channel_id: str, message_id: str, name: str) -> tuple[
     return str(msg["id"]), None
 
 
+def discord_unarchive_thread(thread_id: str) -> str | None:
+    """Reopen a thread if Discord auto-archived it. Hermes auto-threads
+    archive after 24h by default; a slow drive cook + delayed pipeline
+    tick can cross that boundary. Returns err or None."""
+    _, err = _discord_request(
+        "PATCH",
+        f"/channels/{thread_id}",
+        json={"archived": False},
+    )
+    return err
+
+
+def find_existing_auto_thread(channel_id: str, craig_id: str,
+                              panel_id: str | None) -> str | None:
+    """Try to locate an existing thread in #craig-events whose anchor
+    message references this `craig_id` — typically the auto-thread
+    Hermes creates on the listener's response (Hermes is configured
+    with `auto_thread: true`). Reusing it keeps the status flow next
+    to the listener's earlier output instead of spawning a parallel
+    "Recording <date>" thread.
+
+    Walks active threads first; if none match, walks recently-archived
+    too (cheap, the channel is low-volume). Returns thread_id or None."""
+    targets = []
+    resp, err = _discord_request("GET", f"/channels/{channel_id}/threads/active")
+    if not err and resp:
+        targets.extend(resp.get("threads") or [])
+    # auto_archive on Hermes-created threads is short — also peek at
+    # archived public threads (paginated by Discord, single page is fine).
+    resp, err = _discord_request("GET", f"/channels/{channel_id}/threads/archived/public?limit=20")
+    if not err and resp:
+        targets.extend(resp.get("threads") or [])
+
+    for t in targets:
+        parent_id = t.get("parent_id")
+        if not parent_id:
+            continue
+        # Fast check: thread anchored directly on Craig's panel.
+        if panel_id and str(parent_id) == str(panel_id):
+            return str(t["id"])
+        # General check: fetch the parent message and look for craig_id
+        # in its body. Catches the listener-response case (Hermes
+        # auto_thread anchors on the bot's reply, not Craig's panel).
+        msg, merr = _discord_request("GET", f"/channels/{channel_id}/messages/{parent_id}")
+        if merr or not msg:
+            continue
+        body = extract_message_text(msg)
+        if craig_id and craig_id in body:
+            return str(t["id"])
+    return None
+
+
 # Copied from craig-listener/listener.py (Components V2 walker). Craig's
 # recording panel uses Discord Components V2 (flags & 32768) and the
 # panel text lives nested in components[].components[].content, not in
@@ -1217,25 +1269,53 @@ def maybe_self_delete_cron() -> dict:
 # ----------------------------- per-pending pipeline -----------------------------
 
 def _ensure_status_thread(pending: dict, pending_path: pathlib.Path,
-                          panel_id: str | None, date_hhmm: str) -> tuple[str | None, str | None, str | None]:
-    """Make sure we have a header message in #craig-events (replying to
-    Craig's panel) and a thread anchored on it. Persists both IDs in the
-    pending JSON so a crash mid-flow re-uses the same thread on retry
-    (no duplicate headers, no duplicate threads — duplicate per-phase
-    messages within the thread are acceptable noise).
-    Returns (header_id, thread_id, err)."""
+                          panel_id: str | None, craig_id: str,
+                          date_hhmm: str) -> tuple[str | None, str | None, str | None]:
+    """Resolve the thread we'll post phase messages into. Order of
+    preference:
+
+    1. A previously-persisted thread_id from the pending JSON (idempotent
+       resume after a crash mid-flow).
+    2. An existing auto-thread Hermes already created on the listener's
+       reply or on Craig's panel itself — reusing it keeps the status
+       flow under the same conversation tree instead of spawning a
+       parallel "Recording <date>" thread next to it (the user-flagged
+       complaint on 2026-04-26).
+    3. Create our own: post a header message in #craig-events as a
+       reply to Craig's panel, then open a thread on that header.
+
+    Returns (header_id, thread_id, err). header_id may be None when we
+    reused an existing thread (no new header message was posted)."""
     header_id = pending.get("pipeline_header_message_id")
     thread_id = pending.get("pipeline_thread_id")
 
-    if header_id and thread_id:
-        # Verify the thread still exists; if Discord 404s, fall through
-        # and re-create.
-        _, err = _discord_request("GET", f"/channels/{thread_id}")
-        if not err:
+    if thread_id:
+        # Already chose a thread on a previous tick — reuse it. If
+        # Discord auto-archived it, reopen and continue posting.
+        thread_obj, err = _discord_request("GET", f"/channels/{thread_id}")
+        if not err and thread_obj:
+            if thread_obj.get("thread_metadata", {}).get("archived"):
+                discord_unarchive_thread(thread_id)
             return header_id, thread_id, None
+        # 404 / archived-deleted / etc → fall through and re-resolve.
         header_id = None
         thread_id = None
 
+    # Preference 2: an auto-thread already exists.
+    existing = find_existing_auto_thread(CRAIG_EVENTS_CHANNEL_ID, craig_id, panel_id)
+    if existing:
+        # If archived, unarchive so phase posts succeed.
+        thread_obj, _ = _discord_request("GET", f"/channels/{existing}")
+        if thread_obj and thread_obj.get("thread_metadata", {}).get("archived"):
+            discord_unarchive_thread(existing)
+        pending["pipeline_thread_id"] = existing
+        # Drop any prior header_id reference — we won't post a header
+        # outside the thread on this path.
+        pending.pop("pipeline_header_message_id", None)
+        save_pending(pending_path, pending)
+        return None, existing, None
+
+    # Preference 3: create our own header + thread.
     header = (
         f"🎙️ Recording {date_hhmm}\n"
         f"Suivi du pipeline ↓ (réponses dans le thread ci-dessous)."
@@ -1250,9 +1330,6 @@ def _ensure_status_thread(pending: dict, pending_path: pathlib.Path,
         CRAIG_EVENTS_CHANNEL_ID, new_header_id, f"Recording {date_hhmm}",
     )
     if err:
-        # Header is already up; record it but bail. Worst case the
-        # phase messages will land directly under the header on retry
-        # next tick (and pending JSON will be re-tried).
         pending["pipeline_header_message_id"] = new_header_id
         save_pending(pending_path, pending)
         return new_header_id, None, f"thread-create: {err}"
@@ -1284,9 +1361,10 @@ def process_pending(pending_path: pathlib.Path) -> dict:
             return summary
     # If panel_id missing (manual pending), skip the refetch; assume ended.
 
-    # Phase 1 — header + thread (idempotent across retries).
+    # Phase 1 — header + thread (idempotent across retries; reuses the
+    # auto-thread Hermes created on the listener's reply when possible).
     header_id, thread_id, err = _ensure_status_thread(
-        pending, pending_path, panel_id, date_hhmm,
+        pending, pending_path, panel_id, craig_id, date_hhmm,
     )
     if err or not thread_id:
         summary.update({"phase": "status-init-failed", "detail": err})
