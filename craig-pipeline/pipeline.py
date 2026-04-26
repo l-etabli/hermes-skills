@@ -713,15 +713,9 @@ def _wiki_baseline(wiki: pathlib.Path) -> dict[str, dict]:
             continue
         out[rel] = {
             "sha": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-            "lines": text.count("\n") + (0 if text.endswith("\n") or not text else 1),
+            "lines": len(text.splitlines()),
         }
     return out
-
-
-def _line_count(text: str) -> int:
-    if not text:
-        return 0
-    return text.count("\n") + (0 if text.endswith("\n") else 1)
 
 
 def _hallucination_match(text: str) -> str | None:
@@ -768,11 +762,11 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
             text = abs_path.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
             return {"error": f"read failed: {type(exc).__name__}: {exc}"}
-        # Cap content returned to the model — single huge file shouldn't
-        # blow context. 50KB is generous for a wiki page or a 30 min
-        # transcript.
-        if len(text) > 50_000:
-            return {"content": text[:50_000], "truncated": True, "total_bytes": len(text)}
+        # Cap below the agent loop's 8KB tool-result string truncation
+        # (see _agent_loop) so json.dumps wrapping never slices a UTF-8
+        # rune in the middle and feeds the LLM a malformed result.
+        if len(text) > 6_000:
+            return {"content": text[:6_000], "truncated": True, "total_bytes": len(text)}
         return {"content": text}
 
     if name == "list_dir":
@@ -974,9 +968,17 @@ def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
                 n_created += 1 if not existed_before else 0
                 applied.append(edit)
             elif edit["action"] == "append":
+                size = abs_path.stat().st_size
+                needs_sep = False
+                if size > 0:
+                    with abs_path.open("rb") as fh:
+                        fh.seek(-1, 2)
+                        needs_sep = fh.read(1) != b"\n"
+                content = edit["content"]
+                if not content.endswith("\n"):
+                    content += "\n"
                 with abs_path.open("a", encoding="utf-8") as fh:
-                    sep = "" if (abs_path.read_text(encoding="utf-8", errors="replace").endswith("\n") or abs_path.stat().st_size == 0) else "\n"
-                    fh.write(sep + edit["content"] + ("\n" if not edit["content"].endswith("\n") else ""))
+                    fh.write(("\n" if needs_sep else "") + content)
                 applied.append(edit)
             elif edit["action"] == "replace":
                 content = edit["content"]
@@ -1067,7 +1069,7 @@ def _check_guards(touched: dict[str, bool], baseline: dict[str, dict],
         if not abs_path.exists():
             return f"file-vanished: {path}"
         text = abs_path.read_text(encoding="utf-8", errors="replace")
-        new_lines = _line_count(text)
+        new_lines = len(text.splitlines())
         if existed_before:
             old_lines = baseline.get(path, {}).get("lines", 0)
             if old_lines > 0 and new_lines < 0.7 * old_lines:
@@ -1110,6 +1112,9 @@ def _dump_debug(buffer: list[dict], baseline: dict[str, dict], reason: str) -> s
 
 # ----------------------------- debrief generation -----------------------------
 
+# Mirrors meeting-debrief/debrief.py:parse_frontmatter byte-for-byte —
+# duplicated rather than shared because each skill is a self-contained
+# `uv run` script (no inter-skill package). Keep the two in sync.
 def parse_frontmatter(md_text: str) -> tuple[dict, str]:
     if not md_text.startswith("---\n"):
         return {}, md_text
@@ -1233,59 +1238,74 @@ def run_debrief_py(debrief_path: pathlib.Path) -> tuple[int, dict]:
 
 # ----------------------------- self-cron removal -----------------------------
 
-def maybe_self_delete_cron() -> dict:
-    if list_pending():
-        return {"status": "skipped", "reason": "pending-not-empty"}
-    msg = "✅ Suivi craig-watch terminé, tous les recordings ont été traités."
-    msg_id, err = discord_post(DISCORD_HOME_CHANNEL, msg)
-    notif = {"posted_message_id": msg_id, "post_error": err}
-
+def _find_followup_cron_id() -> str | None:
+    """Parse `hermes cron list` and return the job id of the
+    `craig-watch-followup` cron, or None if absent. The CLI prints
+    blocks like `<hex> [active]` followed by `  Name: <name>` lines —
+    the trailing ` [active]` on the id line means we can't match the
+    whole stripped line against the hex regex, so split on whitespace
+    and check the first token only."""
     if not HERMES_CLI.exists():
-        return {**notif, "status": "skipped", "reason": f"hermes-cli-missing: {HERMES_CLI}"}
-    list_proc = subprocess.run([str(HERMES_CLI), "cron", "list"], capture_output=True, text=True, timeout=15)
-    job_id: str | None = None
-    # `hermes cron list` prints blocks like:
-    #   <hex job id> [active]
-    #     Name:      craig-watch-followup
-    #     Schedule:  every 5m
-    #     ...
-    # We scan for the `Name:` line, walk back up to 5 lines, take the
-    # FIRST whitespace-token of each candidate line and accept it iff
-    # it's a hex/dashed id (>=6 chars). Earlier we matched the WHOLE
-    # stripped line against the hex regex — the trailing ` [active]`
-    # broke the match and `maybe_self_delete_cron` reported
-    # `no-cron-found` every tick, so the cron never auto-removed and
-    # spammed #hermes-perso with ✅ messages until the user killed it
-    # manually.
+        return None
+    list_proc = subprocess.run(
+        [str(HERMES_CLI), "cron", "list"],
+        capture_output=True, text=True, timeout=15,
+    )
     lines = list_proc.stdout.splitlines()
     for i, line in enumerate(lines):
         if FOLLOWUP_CRON_NAME in line and "Name" in line:
             for j in range(i - 1, max(-1, i - 5), -1):
                 tokens = lines[j].strip().split()
-                if not tokens:
-                    continue
-                first = tokens[0]
-                if re.fullmatch(r"[0-9a-fA-F-]{6,}", first):
-                    job_id = first
-                    break
-            if job_id:
-                break
-    if not job_id:
-        return {**notif, "status": "no-cron-found", "list_stdout": list_proc.stdout[-300:]}
+                if tokens and re.fullmatch(r"[0-9a-fA-F-]{6,}", tokens[0]):
+                    return tokens[0]
+    return None
 
-    rm = subprocess.run([str(HERMES_CLI), "cron", "remove", job_id],
-                        capture_output=True, text=True, timeout=15)
+
+def maybe_self_delete_cron() -> dict:
+    """Post the ✅ summary to #hermes-perso and remove the followup cron
+    when there is nothing left to process. Order matters: cron removal
+    runs FIRST, the ✅ is posted only after the cron is gone, so a
+    parser failure or remove error doesn't spam the channel each tick
+    (observed prod behaviour 2026-04-26 — the ✅ posted unconditionally
+    and an unrelated parse bug kept the cron alive for ~12 ticks)."""
+    if list_pending():
+        return {"status": "skipped", "reason": "pending-not-empty"}
+
+    if not HERMES_CLI.exists():
+        return {"status": "skipped", "reason": f"hermes-cli-missing: {HERMES_CLI}"}
+    job_id = _find_followup_cron_id()
+    if not job_id:
+        return {"status": "no-cron-found"}
+
+    rm = subprocess.run(
+        [str(HERMES_CLI), "cron", "remove", job_id],
+        capture_output=True, text=True, timeout=15,
+    )
     if rm.returncode != 0:
-        return {**notif, "status": "remove-failed",
+        return {"status": "remove-failed",
                 "detail": (rm.stderr or rm.stdout)[:200], "job_id": job_id}
+
+    msg = "✅ Suivi craig-watch terminé, tous les recordings ont été traités."
+    msg_id, err = discord_post(DISCORD_HOME_CHANNEL, msg)
+    notif = {"posted_message_id": msg_id, "post_error": err}
     return {**notif, "status": "removed", "job_id": job_id}
 
 
 # ----------------------------- per-pending pipeline -----------------------------
 
+def _reopen_if_archived(thread_id: str) -> bool:
+    """GET the thread, unarchive if needed. Returns True iff the thread
+    still exists and is reachable (False on 404 / deletion)."""
+    thread_obj, err = _discord_request("GET", f"/channels/{thread_id}")
+    if err or not thread_obj:
+        return False
+    if thread_obj.get("thread_metadata", {}).get("archived"):
+        discord_unarchive_thread(thread_id)
+    return True
+
+
 def _ensure_status_thread(pending: dict, pending_path: pathlib.Path,
-                          panel_id: str | None, craig_id: str,
-                          date_hhmm: str) -> tuple[str | None, str | None, str | None]:
+                          date_hhmm: str) -> tuple[str | None, str | None]:
     """Resolve the thread we'll post phase messages into. Order of
     preference:
 
@@ -1299,38 +1319,26 @@ def _ensure_status_thread(pending: dict, pending_path: pathlib.Path,
     3. Create our own: post a header message in #craig-events as a
        reply to Craig's panel, then open a thread on that header.
 
-    Returns (header_id, thread_id, err). header_id may be None when we
-    reused an existing thread (no new header message was posted)."""
-    header_id = pending.get("pipeline_header_message_id")
+    Returns (thread_id, err)."""
+    craig_id = pending.get("craig_id") or ""
+    panel_id = pending.get("message_id")
+
     thread_id = pending.get("pipeline_thread_id")
-
+    if thread_id and _reopen_if_archived(thread_id):
+        return thread_id, None
     if thread_id:
-        # Already chose a thread on a previous tick — reuse it. If
-        # Discord auto-archived it, reopen and continue posting.
-        thread_obj, err = _discord_request("GET", f"/channels/{thread_id}")
-        if not err and thread_obj:
-            if thread_obj.get("thread_metadata", {}).get("archived"):
-                discord_unarchive_thread(thread_id)
-            return header_id, thread_id, None
-        # 404 / archived-deleted / etc → fall through and re-resolve.
-        header_id = None
-        thread_id = None
+        # 404'd — fall through and re-resolve.
+        pending.pop("pipeline_thread_id", None)
+        pending.pop("pipeline_header_message_id", None)
 
-    # Preference 2: an auto-thread already exists.
     existing = find_existing_auto_thread(CRAIG_EVENTS_CHANNEL_ID, craig_id, panel_id)
     if existing:
-        # If archived, unarchive so phase posts succeed.
-        thread_obj, _ = _discord_request("GET", f"/channels/{existing}")
-        if thread_obj and thread_obj.get("thread_metadata", {}).get("archived"):
-            discord_unarchive_thread(existing)
+        _reopen_if_archived(existing)
         pending["pipeline_thread_id"] = existing
-        # Drop any prior header_id reference — we won't post a header
-        # outside the thread on this path.
         pending.pop("pipeline_header_message_id", None)
         save_pending(pending_path, pending)
-        return None, existing, None
+        return existing, None
 
-    # Preference 3: create our own header + thread.
     header = (
         f"🎙️ Recording {date_hhmm}\n"
         f"Suivi du pipeline ↓ (réponses dans le thread ci-dessous)."
@@ -1339,20 +1347,19 @@ def _ensure_status_thread(pending: dict, pending_path: pathlib.Path,
         CRAIG_EVENTS_CHANNEL_ID, header, reply_to=panel_id,
     )
     if err:
-        return None, None, f"header-post: {err}"
+        return None, f"header-post: {err}"
+    pending["pipeline_header_message_id"] = new_header_id
 
     new_thread_id, err = discord_create_thread(
         CRAIG_EVENTS_CHANNEL_ID, new_header_id, f"Recording {date_hhmm}",
     )
     if err:
-        pending["pipeline_header_message_id"] = new_header_id
         save_pending(pending_path, pending)
-        return new_header_id, None, f"thread-create: {err}"
+        return None, f"thread-create: {err}"
 
-    pending["pipeline_header_message_id"] = new_header_id
     pending["pipeline_thread_id"] = new_thread_id
     save_pending(pending_path, pending)
-    return new_header_id, new_thread_id, None
+    return new_thread_id, None
 
 
 def process_pending(pending_path: pathlib.Path) -> dict:
@@ -1364,7 +1371,6 @@ def process_pending(pending_path: pathlib.Path) -> dict:
 
     summary: dict = {"craig_id": craig_id, "phase": "start"}
 
-    # Phase 0 — refetch panel.
     if panel_id:
         panel, err = discord_get_message(channel_id, panel_id)
         if err:
@@ -1374,13 +1380,10 @@ def process_pending(pending_path: pathlib.Path) -> dict:
         if not ENDED_RE.search(body):
             summary.update({"phase": "still-recording"})
             return summary
-    # If panel_id missing (manual pending), skip the refetch; assume ended.
+    # Manual pendings without a panel_id (debug runs) skip the refetch
+    # and assume the recording is already over.
 
-    # Phase 1 — header + thread (idempotent across retries; reuses the
-    # auto-thread Hermes created on the listener's reply when possible).
-    header_id, thread_id, err = _ensure_status_thread(
-        pending, pending_path, panel_id, craig_id, date_hhmm,
-    )
+    thread_id, err = _ensure_status_thread(pending, pending_path, date_hhmm)
     if err or not thread_id:
         summary.update({"phase": "status-init-failed", "detail": err})
         return summary
@@ -1489,13 +1492,18 @@ def process_pending(pending_path: pathlib.Path) -> dict:
 
     post_phase("inprogress", "Génération debrief (OpenRouter)…")
 
-    # Phase 5 — debrief JSON.
     DEBRIEFS_DIR.mkdir(parents=True, exist_ok=True)
     debrief_path = DEBRIEFS_DIR / f"{transcript_abs.stem}.json"
+    try:
+        schema = json.loads(DEBRIEF_SCHEMA.read_text(encoding="utf-8"))
+    except Exception as exc:
+        post_phase("error", f"Schema debrief introuvable: {exc}")
+        summary.update({"phase": "schema-load-error", "detail": str(exc)})
+        return summary
+
     if debrief_path.exists():
         try:
             debrief_data = json.loads(debrief_path.read_text(encoding="utf-8"))
-            schema = json.loads(DEBRIEF_SCHEMA.read_text(encoding="utf-8"))
             errors = list(Draft202012Validator(schema).iter_errors(debrief_data))
             if errors:
                 debrief_path.unlink()
@@ -1506,12 +1514,6 @@ def process_pending(pending_path: pathlib.Path) -> dict:
                 pass
 
     if not debrief_path.exists():
-        try:
-            schema = json.loads(DEBRIEF_SCHEMA.read_text(encoding="utf-8"))
-        except Exception as exc:
-            post_phase("error", f"Schema debrief introuvable: {exc}")
-            summary.update({"phase": "schema-load-error", "detail": str(exc)})
-            return summary
         debrief_data, gen_err = generate_debrief(transcript_abs, schema)
         if not debrief_data:
             post_phase("error", f"Génération debrief LLM échouée : "
