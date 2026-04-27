@@ -54,6 +54,14 @@ Active-toi **uniquement** quand un autre skill (`craig-listener` ou `craig-scan`
 
 ## Procedure
 
+### Continuité du pipeline (RÈGLE DURE)
+
+Une fois `scan.py` lancé, **les étapes 3 → 7 forment un pipeline atomique côté agent**. Tu n'as PAS le droit de terminer ton tour sur un message texte d'annonce ("Je vais maintenant procéder à...", "On enchaîne avec l'ingest...", "Je commence par le push"). Chaque étape doit être suivie **immédiatement** dans le même tour par le tool call qui l'exécute (`terminal` pour git pull/add/commit/push, `skill_view` puis l'invocation pour `llm-wiki ingest`, etc.).
+
+Le seul message texte autorisé en fin de tour est la **confirmation finale (étape 7)** — et uniquement après que push + ingest ont tous deux réussi. Si une étape intermédiaire échoue, surface l'erreur ET le tool call de remédiation dans le même tour, pas un message texte qui demande à l'utilisateur quoi faire.
+
+Vu en prod le 2026-04-27 : transcript écrit, LLM a posté "C'est passé ! Je vais maintenant 1) commit, 2) ingest, 3) debrief" puis a terminé son tour → le runtime a considéré la réponse comme finale, le pipeline est resté en plan, le raw n'était ni commité ni ingéré jusqu'à intervention manuelle.
+
 ### Conventions runtime
 
 Avant de lancer, observe ces règles propres à l'environnement Hermes :
