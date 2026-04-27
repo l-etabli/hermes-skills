@@ -225,10 +225,22 @@ def extract_and_mix(zip_path: pathlib.Path, tmpdir: pathlib.Path) -> tuple[pathl
     return out, speakers
 
 
+class GroqHTTPError(RuntimeError):
+    """HTTP error from Groq with response body captured."""
+    def __init__(self, status: int, body: str, attempts: int):
+        self.status = status
+        self.body = body
+        self.attempts = attempts
+        super().__init__(f"groq HTTP {status} after {attempts} attempt(s): {body[:500]}")
+
+
 def _post_groq(audio_path: pathlib.Path, *, max_attempts: int = 3) -> dict:
     """POST to Groq with retry on transient 5xx / 429. Each attempt re-opens
-    the file (consumed body on retry) and waits a short backoff."""
-    last_exc: Exception | None = None
+    the file (consumed body on retry) and waits a short backoff. On final
+    failure, raises GroqHTTPError with the response body captured for
+    diagnostics."""
+    last_status: int | None = None
+    last_body: str = ""
     for attempt in range(1, max_attempts + 1):
         try:
             with open(audio_path, "rb") as fh:
@@ -244,20 +256,23 @@ def _post_groq(audio_path: pathlib.Path, *, max_attempts: int = 3) -> dict:
                     },
                     timeout=300,
                 )
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts:
-                time.sleep(2 ** attempt)
-                continue
-            r.raise_for_status()
-            return r.json()
         except requests.RequestException as exc:
-            last_exc = exc
+            last_status = -1
+            last_body = f"{type(exc).__name__}: {exc}"
             if attempt < max_attempts:
                 time.sleep(2 ** attempt)
                 continue
-            raise
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("groq retry loop exited without result")
+            raise GroqHTTPError(last_status, last_body, attempt) from exc
+        if r.status_code == 200:
+            return r.json()
+        last_status = r.status_code
+        last_body = r.text or ""
+        retryable = r.status_code in (429, 500, 502, 503, 504)
+        if retryable and attempt < max_attempts:
+            time.sleep(2 ** attempt)
+            continue
+        raise GroqHTTPError(last_status, last_body, attempt)
+    raise GroqHTTPError(last_status or -1, last_body, max_attempts)
 
 
 def probe_duration_s(audio_path: pathlib.Path) -> float:
@@ -498,6 +513,11 @@ def main() -> int:
             return 0
     except subprocess.CalledProcessError as exc:
         emit({"status": "error", "reason": "ffmpeg-failed", "detail": str(exc)})
+        return 1
+    except GroqHTTPError as exc:
+        emit({"status": "error", "reason": "groq-http-error",
+              "http_status": exc.status, "attempts": exc.attempts,
+              "detail": str(exc), "body": exc.body[:1500]})
         return 1
     except requests.HTTPError as exc:
         emit({"status": "error", "reason": "groq-http-error", "detail": str(exc)})
