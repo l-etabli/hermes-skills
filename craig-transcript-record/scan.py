@@ -34,6 +34,8 @@ Output (stdout, one JSON object per line):
     {"status": "progress", "phase": "drive-poll-start"}
     {"status": "progress", "phase": "zip-found", "name": "...", "size_bytes": N}
     {"status": "progress", "phase": "groq-start"}
+    {"status": "progress", "phase": "groq-split", "n_chunks": K, "chunk_dur_s": F}
+    {"status": "progress", "phase": "groq-chunk", "idx": i, "of": K, "size_bytes": N}
     {"status": "progress", "phase": "writing-raw"}
 
   Followed by a single canonical result line (always the LAST line of
@@ -99,6 +101,10 @@ DRIVE_FOLDER_ID = os.environ["AUDIO_DRIVE_FOLDER_ID"]
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MAX_BYTES = 25 * 1024 * 1024
+# Target chunk size when splitting. Below the 25MB Groq cap with headroom
+# for the inevitable mismatch between (size / total) extrapolation and the
+# actual size of each FLAC re-encoded segment.
+GROQ_CHUNK_TARGET_BYTES = 20 * 1024 * 1024
 
 # Drive polling: Craig cooks the recording then uploads to Drive. In
 # practice this is 1-5 min for short recordings, up to 15 min for long
@@ -214,13 +220,7 @@ def extract_and_mix(zip_path: pathlib.Path, tmpdir: pathlib.Path) -> tuple[pathl
     return out, speakers
 
 
-def transcribe_groq(audio_path: pathlib.Path) -> dict:
-    size = audio_path.stat().st_size
-    if size > GROQ_MAX_BYTES:
-        raise RuntimeError(
-            f"audio {size/1e6:.1f}MB > {GROQ_MAX_BYTES/1e6:.0f}MB Groq limit; "
-            "re-encode lower (ffmpeg -ab 96k -ar 16000) or split"
-        )
+def _post_groq(audio_path: pathlib.Path) -> dict:
     with open(audio_path, "rb") as fh:
         r = requests.post(
             GROQ_URL,
@@ -236,6 +236,75 @@ def transcribe_groq(audio_path: pathlib.Path) -> dict:
         )
     r.raise_for_status()
     return r.json()
+
+
+def probe_duration_s(audio_path: pathlib.Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
+        check=True, capture_output=True, text=True,
+    )
+    return float(out.stdout.strip())
+
+
+def split_audio(audio_path: pathlib.Path, tmpdir: pathlib.Path) -> list[tuple[pathlib.Path, float]]:
+    """Split a FLAC file into N chunks targeting GROQ_CHUNK_TARGET_BYTES.
+    Returns [(chunk_path, start_offset_s), ...] in order. Re-encodes to
+    FLAC so segment durations are honoured exactly (stream-copy splitting
+    of FLAC is unreliable across container/keyframe layouts)."""
+    size = audio_path.stat().st_size
+    duration = probe_duration_s(audio_path)
+    n_chunks = max(2, -(-size // GROQ_CHUNK_TARGET_BYTES))  # ceil
+    chunk_dur = duration / n_chunks
+    chunks_dir = tmpdir / "chunks"
+    chunks_dir.mkdir(exist_ok=True)
+    pattern = str(chunks_dir / "chunk_%03d.flac")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(audio_path),
+         "-f", "segment", "-segment_time", f"{chunk_dur:.3f}",
+         "-reset_timestamps", "1", "-c:a", "flac", pattern],
+        check=True,
+    )
+    chunks = sorted(chunks_dir.glob("chunk_*.flac"))
+    if not chunks:
+        raise RuntimeError("ffmpeg segmenter produced no chunks")
+    emit_progress("groq-split", n_chunks=len(chunks), chunk_dur_s=round(chunk_dur, 1))
+    return [(p, i * chunk_dur) for i, p in enumerate(chunks)]
+
+
+def transcribe_groq(audio_path: pathlib.Path) -> dict:
+    size = audio_path.stat().st_size
+    if size <= GROQ_MAX_BYTES:
+        return _post_groq(audio_path)
+
+    # Too big for a single Groq call: split into ~20MB chunks, transcribe
+    # each, then merge segments with their start-offset re-applied so the
+    # final timeline matches the original recording.
+    chunks = split_audio(audio_path, audio_path.parent)
+    merged_segments: list[dict] = []
+    merged_text_parts: list[str] = []
+    total_duration = 0.0
+    language: str | None = None
+    for idx, (chunk_path, offset_s) in enumerate(chunks, start=1):
+        emit_progress("groq-chunk", idx=idx, of=len(chunks),
+                      size_bytes=chunk_path.stat().st_size)
+        tx = _post_groq(chunk_path)
+        for seg in tx.get("segments") or []:
+            seg = dict(seg)
+            seg["start"] = float(seg.get("start", 0)) + offset_s
+            seg["end"] = float(seg.get("end", 0)) + offset_s
+            merged_segments.append(seg)
+        if tx.get("text"):
+            merged_text_parts.append(tx["text"])
+        total_duration += float(tx.get("duration", 0) or 0)
+        if not language and tx.get("language"):
+            language = tx.get("language")
+    return {
+        "segments": merged_segments,
+        "text": " ".join(merged_text_parts).strip(),
+        "duration": total_duration,
+        "language": language or "?",
+    }
 
 
 def parse_recorded_at(name: str, drive_created: str) -> str:

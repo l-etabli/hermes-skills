@@ -89,7 +89,7 @@ Le script :
 2. Poll Drive jusqu'à voir `craig_<id>_*.flac.zip` apparaître. Backoff 30→60→120 s, **timeout 20 min** (couvre le cook + upload Craig worst-case).
 3. Re-vérifie l'idempotence par `drive_id`.
 4. Download le zip, extrait les `.flac` (un par speaker), mixe via `ffmpeg amix` si N>1.
-5. Transcrit via Groq Whisper Large v3 Turbo.
+5. Transcrit via Groq Whisper Large v3 Turbo. Si l'audio mixé dépasse la limite Groq (25 MB), le script découpe automatiquement le FLAC en chunks ~20 MB via `ffmpeg -f segment`, transcrit chaque chunk séparément, puis fusionne les `segments` en ré-appliquant le décalage temporel — la timeline finale reste alignée sur l'enregistrement original.
 6. Écrit `raw/transcripts/<date>-craig-<id>-<date>.md` avec frontmatter complet.
 7. Émet **un seul** objet JSON sur stdout :
 
@@ -146,7 +146,7 @@ Quand tout est OK :
 - **Le `sha256` se calcule sur le body uniquement** (après le `---` de fermeture). Sinon le hash dérive avec `ingested:` et la dédup est cassée.
 - **Pas de diarisation** : Groq Whisper ne sépare pas les speakers. Tout le body est `???` sauf si un seul speaker est connu.
 - **Audio sans paroles** : Groq retourne `segments: []` → `status: error / empty-transcription`. Aucun raw n'est écrit.
-- **Audio > 25 MB** : abandon. Suggérer re-encoding (`ffmpeg -ab 96k -ar 16000`) ou découpe.
+- **Audio > 25 MB** : géré automatiquement par découpe ffmpeg en chunks ~20 MB, transcription par chunk, puis fusion des segments avec offset temporel. Aucune action côté agent — surveiller juste les progress events `groq-split` / `groq-chunk` (utiles pour un message de statut Discord live).
 - **SA sans accès au dossier** : `files.list` renvoie une liste vide (pas une erreur de permission). Le script va donc poll 20 min puis renvoyer `drive-poll-timeout`. Si ça arrive systématiquement, vérifier que `AUDIO_DRIVE_FOLDER_ID` est partagé avec l'email du SA.
 - **Pas de filtrage par channel/instance** : V3 ne fait AUCUNE décision de routing. Le routing est garanti par les permissions Discord (chaque instance ne voit que son `#craig-events`). Si tu reçois un recording ID, il est pour toi.
 - **Pas de `git remote set-url` avec token, ni `export GITHUB_TOKEN=...`** : le credential helper infra fait le boulot. Ces commandes déclenchent le scanner de sécurité Hermes inutilement.
