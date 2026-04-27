@@ -225,6 +225,35 @@ def extract_and_mix(zip_path: pathlib.Path, tmpdir: pathlib.Path) -> tuple[pathl
     return out, speakers
 
 
+# Trim the first 5 seconds of the mix when re-encoding for Groq. Craig's
+# per-speaker FLACs frequently start with a connect-blip / silence
+# sequence that adds noise to the transcript without information value.
+# The user has explicitly OK'd this (any meeting opener is captured later
+# in the recording anyway).
+PRE_TRIM_S = 5
+
+
+def to_mp3_for_groq(audio_path: pathlib.Path, tmpdir: pathlib.Path) -> pathlib.Path:
+    """Re-encode the mixed audio to a Whisper-grade MP3 (16 kHz mono,
+    64 kbps). This is what Groq accepts most cleanly and shrinks the
+    payload ~4-5x vs the source FLAC, which usually folds the recording
+    back under the 25 MB single-call cap. Also strips the first 5s
+    (PRE_TRIM_S) of the recording — see the constant for rationale.
+
+    Returns the MP3 path; the segmenter (when needed) will stream-copy it
+    rather than re-encode."""
+    out = tmpdir / "mix.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-ss", str(PRE_TRIM_S), "-i", str(audio_path),
+         "-ac", "1", "-ar", "16000",
+         "-c:a", "libmp3lame", "-b:a", "64k",
+         str(out)],
+        check=True,
+    )
+    return out
+
+
 class GroqHTTPError(RuntimeError):
     """HTTP error from Groq with response body captured."""
     def __init__(self, status: int, body: str, attempts: int):
@@ -243,11 +272,12 @@ def _post_groq(audio_path: pathlib.Path, *, max_attempts: int = 3) -> dict:
     last_body: str = ""
     for attempt in range(1, max_attempts + 1):
         try:
+            mime = "audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/flac"
             with open(audio_path, "rb") as fh:
                 r = requests.post(
                     GROQ_URL,
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    files={"file": (audio_path.name, fh, "audio/flac")},
+                    files={"file": (audio_path.name, fh, mime)},
                     data={
                         "model": "whisper-large-v3-turbo",
                         "response_format": "verbose_json",
@@ -285,32 +315,27 @@ def probe_duration_s(audio_path: pathlib.Path) -> float:
 
 
 def split_audio(audio_path: pathlib.Path, tmpdir: pathlib.Path) -> list[tuple[pathlib.Path, float]]:
-    """Split a FLAC file into N chunks targeting GROQ_CHUNK_TARGET_BYTES.
-    Returns [(chunk_path, start_offset_s), ...] in order. Re-encodes to
-    FLAC so segment durations are honoured exactly (stream-copy splitting
-    of FLAC is unreliable across container/keyframe layouts)."""
+    """Split an MP3 file into N chunks targeting GROQ_CHUNK_TARGET_BYTES.
+    Stream-copy (`-c copy`): MP3 has fixed-size frames every ~26ms with
+    self-contained headers, so the segment muxer cuts cleanly without
+    re-encoding. Returns [(chunk_path, start_offset_s), ...] in order."""
     size = audio_path.stat().st_size
     duration = probe_duration_s(audio_path)
     n_chunks = max(2, -(-size // GROQ_CHUNK_TARGET_BYTES))  # ceil
-    # Bias chunk_dur slightly upward so the segmenter doesn't emit a
-    # spurious header-only tail chunk when (duration / n) doesn't land on
-    # a frame boundary. +0.5s is well below our 5MB headroom under the
-    # Groq cap and prevents the 8KB tail that triggers Groq 500.
-    chunk_dur = (duration / n_chunks) + 0.5
+    chunk_dur = duration / n_chunks
     chunks_dir = tmpdir / "chunks"
     chunks_dir.mkdir(exist_ok=True)
-    pattern = str(chunks_dir / "chunk_%03d.flac")
+    pattern = str(chunks_dir / "chunk_%03d.mp3")
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(audio_path),
          "-f", "segment", "-segment_time", f"{chunk_dur:.3f}",
-         "-reset_timestamps", "1", "-c:a", "flac", pattern],
+         "-reset_timestamps", "1", "-c", "copy", pattern],
         check=True,
     )
-    raw_chunks = sorted(chunks_dir.glob("chunk_*.flac"))
+    raw_chunks = sorted(chunks_dir.glob("chunk_*.mp3"))
     if not raw_chunks:
         raise RuntimeError("ffmpeg segmenter produced no chunks")
-    # Drop tail chunks that are pure FLAC header (no audio frames). Groq
-    # 500s on those, and they have nothing to transcribe anyway.
+    # Defensive filter: drop chunks too small to contain real audio.
     chunks = [p for p in raw_chunks if p.stat().st_size >= GROQ_MIN_CHUNK_BYTES]
     if not chunks:
         raise RuntimeError("all chunks below min-size threshold (audio empty?)")
@@ -483,7 +508,8 @@ def main() -> int:
             tmpdir = pathlib.Path(td)
             zip_path = tmpdir / f["name"]
             download_to(drive, f["id"], zip_path)
-            audio, speakers = extract_and_mix(zip_path, tmpdir)
+            mixed, speakers = extract_and_mix(zip_path, tmpdir)
+            audio = to_mp3_for_groq(mixed, tmpdir)
             try:
                 total_dur_s = round(probe_duration_s(audio), 1)
             except Exception:
@@ -491,9 +517,18 @@ def main() -> int:
             emit_progress("audio-ready",
                           size_bytes=audio.stat().st_size,
                           duration_s=total_dur_s,
-                          n_speakers=len(speakers))
+                          n_speakers=len(speakers),
+                          format="mp3", pre_trim_s=PRE_TRIM_S)
             emit_progress("groq-start")
             tx = transcribe_groq(audio)
+            # Re-align transcript timeline to the original recording: we
+            # trimmed the first PRE_TRIM_S seconds before sending to Groq,
+            # so all returned timestamps need that offset back.
+            if PRE_TRIM_S:
+                for seg in tx.get("segments") or []:
+                    seg["start"] = float(seg.get("start", 0)) + PRE_TRIM_S
+                    seg["end"] = float(seg.get("end", 0)) + PRE_TRIM_S
+                tx["duration"] = float(tx.get("duration", 0) or 0) + PRE_TRIM_S
             if not tx.get("segments"):
                 emit({"status": "error", "reason": "empty-transcription",
                       "detail": "Groq returned 0 segments (silence?)"})
