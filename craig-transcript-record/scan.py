@@ -33,8 +33,9 @@ Output (stdout, one JSON object per line):
 
     {"status": "progress", "phase": "drive-poll-start"}
     {"status": "progress", "phase": "zip-found", "name": "...", "size_bytes": N}
+    {"status": "progress", "phase": "audio-ready", "size_bytes": N, "duration_s": F, "n_speakers": K}
     {"status": "progress", "phase": "groq-start"}
-    {"status": "progress", "phase": "groq-split", "n_chunks": K, "chunk_dur_s": F}
+    {"status": "progress", "phase": "groq-split", "n_chunks": K, "chunk_dur_s": F, "total_dur_s": F}
     {"status": "progress", "phase": "groq-chunk", "idx": i, "of": K, "size_bytes": N}
     {"status": "progress", "phase": "writing-raw"}
 
@@ -105,6 +106,10 @@ GROQ_MAX_BYTES = 25 * 1024 * 1024
 # for the inevitable mismatch between (size / total) extrapolation and the
 # actual size of each FLAC re-encoded segment.
 GROQ_CHUNK_TARGET_BYTES = 20 * 1024 * 1024
+# Below this, a chunk is almost certainly the spurious tail produced by
+# ffmpeg's segment muxer when segment_time doesn't divide duration evenly
+# (header-only FLAC, no audio frames). Groq returns 500 on these.
+GROQ_MIN_CHUNK_BYTES = 64 * 1024
 
 # Drive polling: Craig cooks the recording then uploads to Drive. In
 # practice this is 1-5 min for short recordings, up to 15 min for long
@@ -220,22 +225,39 @@ def extract_and_mix(zip_path: pathlib.Path, tmpdir: pathlib.Path) -> tuple[pathl
     return out, speakers
 
 
-def _post_groq(audio_path: pathlib.Path) -> dict:
-    with open(audio_path, "rb") as fh:
-        r = requests.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files={"file": (audio_path.name, fh, "audio/flac")},
-            data={
-                "model": "whisper-large-v3-turbo",
-                "response_format": "verbose_json",
-                "language": "fr",
-                "temperature": "0",
-            },
-            timeout=300,
-        )
-    r.raise_for_status()
-    return r.json()
+def _post_groq(audio_path: pathlib.Path, *, max_attempts: int = 3) -> dict:
+    """POST to Groq with retry on transient 5xx / 429. Each attempt re-opens
+    the file (consumed body on retry) and waits a short backoff."""
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with open(audio_path, "rb") as fh:
+                r = requests.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    files={"file": (audio_path.name, fh, "audio/flac")},
+                    data={
+                        "model": "whisper-large-v3-turbo",
+                        "response_format": "verbose_json",
+                        "language": "fr",
+                        "temperature": "0",
+                    },
+                    timeout=300,
+                )
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                time.sleep(2 ** attempt)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("groq retry loop exited without result")
 
 
 def probe_duration_s(audio_path: pathlib.Path) -> float:
@@ -255,7 +277,11 @@ def split_audio(audio_path: pathlib.Path, tmpdir: pathlib.Path) -> list[tuple[pa
     size = audio_path.stat().st_size
     duration = probe_duration_s(audio_path)
     n_chunks = max(2, -(-size // GROQ_CHUNK_TARGET_BYTES))  # ceil
-    chunk_dur = duration / n_chunks
+    # Bias chunk_dur slightly upward so the segmenter doesn't emit a
+    # spurious header-only tail chunk when (duration / n) doesn't land on
+    # a frame boundary. +0.5s is well below our 5MB headroom under the
+    # Groq cap and prevents the 8KB tail that triggers Groq 500.
+    chunk_dur = (duration / n_chunks) + 0.5
     chunks_dir = tmpdir / "chunks"
     chunks_dir.mkdir(exist_ok=True)
     pattern = str(chunks_dir / "chunk_%03d.flac")
@@ -265,10 +291,17 @@ def split_audio(audio_path: pathlib.Path, tmpdir: pathlib.Path) -> list[tuple[pa
          "-reset_timestamps", "1", "-c:a", "flac", pattern],
         check=True,
     )
-    chunks = sorted(chunks_dir.glob("chunk_*.flac"))
-    if not chunks:
+    raw_chunks = sorted(chunks_dir.glob("chunk_*.flac"))
+    if not raw_chunks:
         raise RuntimeError("ffmpeg segmenter produced no chunks")
-    emit_progress("groq-split", n_chunks=len(chunks), chunk_dur_s=round(chunk_dur, 1))
+    # Drop tail chunks that are pure FLAC header (no audio frames). Groq
+    # 500s on those, and they have nothing to transcribe anyway.
+    chunks = [p for p in raw_chunks if p.stat().st_size >= GROQ_MIN_CHUNK_BYTES]
+    if not chunks:
+        raise RuntimeError("all chunks below min-size threshold (audio empty?)")
+    emit_progress("groq-split", n_chunks=len(chunks),
+                  chunk_dur_s=round(chunk_dur, 1),
+                  total_dur_s=round(duration, 1))
     return [(p, i * chunk_dur) for i, p in enumerate(chunks)]
 
 
@@ -436,6 +469,14 @@ def main() -> int:
             zip_path = tmpdir / f["name"]
             download_to(drive, f["id"], zip_path)
             audio, speakers = extract_and_mix(zip_path, tmpdir)
+            try:
+                total_dur_s = round(probe_duration_s(audio), 1)
+            except Exception:
+                total_dur_s = None
+            emit_progress("audio-ready",
+                          size_bytes=audio.stat().st_size,
+                          duration_s=total_dur_s,
+                          n_speakers=len(speakers))
             emit_progress("groq-start")
             tx = transcribe_groq(audio)
             if not tx.get("segments"):
