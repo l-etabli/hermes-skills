@@ -78,30 +78,53 @@ ls -lh /opt/data/cache/documents/doc_xxx_<filename>
 
 Le bridge a deja filtre sur `SUPPORTED_DOCUMENT_TYPES` (incluant `.pdf`) et capote a 32 MB par fichier. Si le fichier est absent du cache, c'est probablement un type non supporte ou un overflow taille — surface l'erreur, n'essaie pas de re-telecharger depuis Discord.
 
-### 3. Extraire le contenu avec le tool `web_extract`
+### 3. Extraire le contenu du PDF (ou doc) avec `pdftotext`
 
-**`llm-wiki` n'est PAS une CLI.** Il n'existe **aucun binaire `llm-wiki` dans le PATH** — c'est un **playbook** (cf. `skills/research/llm-wiki/SKILL.md` upstream) que tu dois derouler avec **tes propres tools Hermes**, pas via un appel shell.
+**`llm-wiki` n'est PAS une CLI.** Il n'existe aucun binaire `llm-wiki` dans le PATH — c'est un **playbook** (cf. `skills/research/llm-wiki/SKILL.md` upstream) que tu derouleras toi-meme inline a l'etape 4. **`web_extract` n'est PAS un tool agent non plus** — c'est un modele auxiliaire interne (cf. `config.yaml: auxiliary.web_extract`), pas dans ta toolbox. Idem : `vision_analyze` ne lit que les **vraies images** (jpg/png), pas les PDFs.
 
-Pour extraire le texte/contenu d'un PDF (ou d'un .docx, .pptx, ...), invoque le **tool `web_extract`** d'Hermes sur le chemin local cache :
+**Le bon chemin dans cet environnement est `pdftotext`** (binaire poppler-utils). Il est present dans l'image extras hermes-agent-extras (cf. `hermes-infra/AGENTS.md` § "Image extras"). Invoque-le via `terminal` :
 
+```bash
+pdftotext -layout /opt/data/cache/documents/doc_<uuid>_<file>.pdf /tmp/<descriptive-name>.txt
+cat /tmp/<descriptive-name>.txt | head -100   # verifier
 ```
-web_extract(url="/opt/data/cache/documents/doc_<uuid>_<file1>.pdf")
-web_extract(url="/opt/data/cache/documents/doc_<uuid>_<file2>.pdf")
+
+Le flag `-layout` preserve les colonnes/tableaux (essentiel pour les devis et propositions structures). Pour des PDFs purement textuels la sortie est exploitable telle quelle.
+
+**Si le texte vectoriel est insuffisant** (PDF scanne, schema, image de tableau) : passe par `pdftoppm` pour rasteriser, puis appelle `vision_analyze` sur chaque page :
+
+```bash
+mkdir -p /tmp/pages-<descriptive-name>
+pdftoppm -png -r 150 /opt/data/cache/documents/doc_<uuid>_<file>.pdf /tmp/pages-<descriptive-name>/p
+ls /tmp/pages-<descriptive-name>/
 ```
 
-`web_extract` accepte les paths locaux **ET** les URLs (cf. SKILL.md upstream `llm-wiki` § Core Operations / Ingest etape ① : « PDF → use `web_extract` (handles PDFs), save to `raw/papers/` »). Sous le capot c'est le modele auxiliaire `auxiliary.web_extract` (typiquement gemini-2.5-flash, multimodal, cheap, gere bien les PDFs natifs).
+Puis invoque le **tool `vision_analyze`** (vrai tool dans la toolbox Hermes) sur chaque PNG sequentiellement.
 
-**Anti-patterns observes en prod le 2026-04-28 sur Telluris (haiku-4.5)** — ne fais PAS :
-- `pip install pypdf` / `pip install PyMuPDF` / `pip install fitz` -> pollue le container, ne survit pas au restart, et c'est inutile (web_extract gere les PDFs).
-- `pdftotext -layout ...` -> n'est meme pas installe par defaut, et meme si c'etait le cas, web_extract est un meilleur passage (preserve la structure + multimodal).
-- `python3 -c "import fitz; ..."` heredoc -> idem, contournement inutile.
-- `browser_navigate file:///opt/data/wiki/raw/papers/...pdf` -> le browser ne rend pas les PDFs proprement, et ca consomme un browser session pour rien.
-- `convert -density 150 ...pdf ...png` puis `vision_analyze` page par page -> tres lent, perd le texte vectoriel selectable, et c'est exactement ce que web_extract fait deja en interne mais en mieux.
-- Tenter d'invoquer `llm-wiki ingest <path>` au shell -> commande inexistante, retourne "command not found".
+**Si tu prefe Python** : `pypdf` et `pdfplumber` sont installes dans l'image extras :
+
+```bash
+python3 -c "
+from pypdf import PdfReader
+r = PdfReader('/opt/data/cache/documents/doc_<uuid>_<file>.pdf')
+for i, page in enumerate(r.pages):
+    print(f'=== page {i+1} ==='); print(page.extract_text())
+"
+```
+
+**Anti-patterns formellement interdits** (chacun a fait perdre 30+ min en prod le 2026-04-28 sur Telluris haiku-4.5 avant ce patch) :
+
+- ❌ `pip install pypdf` / `pip install PyMuPDF` / `pip install fitz` -> **inutile maintenant** : pypdf et pdfplumber sont preinstalles dans l'image extras. Si l'import echoue, surface l'erreur — ne re-installe rien.
+- ❌ `python3 -c "import fitz; ..."` -> fitz/PyMuPDF n'est pas pre-install, et le besoin est couvert par pypdf. Ne te bats pas avec.
+- ❌ `python3 -c "import zlib; ... pdf stream extraction"` -> reverse engineering du format PDF a la main, completement absurde.
+- ❌ `browser_navigate file:///opt/data/cache/documents/...pdf` -> le browser ne rend pas les PDFs proprement et c'est lent.
+- ❌ `python3 -c "from hermes_tools import web_extract"` -> `web_extract` n'est pas une fonction Python importable, c'est un modele aux interne (et meme pas un tool exposé a l'agent).
+- ❌ `delegate_task` / subagent -> proscrit pour cet ingest, cf. § Pitfalls.
+- ❌ Tenter `llm-wiki ingest <path>` au shell -> commande inexistante.
 
 ### 4. Derouler l'ingest llm-wiki inline
 
-Une fois le texte extrait via `web_extract`, applique les **6 etapes du playbook `llm-wiki` ingest** (cf. `skill_view: llm-wiki`, section "Core Operations / 1. Ingest") :
+Une fois le texte extrait, applique les **6 etapes du playbook `llm-wiki` ingest** (cf. `skill_view: llm-wiki`, section "Core Operations / 1. Ingest") :
 
 ① **Capture raw** : ecris le markdown extrait dans `$WIKI_PATH/raw/papers/<descriptive-name>.md` avec frontmatter (`source_url: discord-attachment`, `ingested: YYYY-MM-DD`, `sha256: <body-hash>`). Optionnellement copie le PDF original a cote (`<descriptive-name>.pdf`) si la ré-inspection visuelle peut etre utile plus tard.
 ② **(Skippable en mode auto)** Discuter takeaways avec l'utilisateur — si la demande est explicitement « ingere ces docs » sans question, passe directement a ③.
@@ -130,4 +153,4 @@ Pour chaque etape, utilise tes tools natifs (`terminal` pour les ecritures fs et
 
 ## Pourquoi pas un script `wiki_attach.py` dedie
 
-L'ingest est un **playbook LLM** par construction : la valeur ajoutee est dans le jugement (quelles entites creer, quels wikilinks tracer, quelle taxonomie de tags appliquer) — pas dans le pipe shell deterministe. `web_extract` fait l'extraction, le LLM fait la synthese. Pas de code Python a maintenir.
+L'ingest est un **playbook LLM** par construction : la valeur ajoutee est dans le jugement (quelles entites creer, quels wikilinks tracer, quelle taxonomie de tags appliquer) — pas dans le pipe shell deterministe. `pdftotext` fait l'extraction (deterministe), le LLM fait la synthese (jugement). Pas de code Python a maintenir.
