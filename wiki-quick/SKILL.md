@@ -30,8 +30,9 @@ L'utilisateur demande explicitement à archiver un échange ou une note libre da
 - « note ça : … »
 
 **Contre-indications** :
-- Lien web / PDF / fichier upload → utilise `llm-wiki ingest` directement (web_extract upstream).
-- Transcript voix Craig → c'est `craig-pipeline` qui s'en occupe automatiquement.
+- Pièce jointe Discord (PDF, docx, image, audio uploadé dans le message) → utilise le skill `wiki-attach`. Le bridge upstream a déjà téléchargé le fichier via le bot token authentifié dans `/opt/data/cache/{documents,images,audio}/` ; `wiki-attach` explique comment le retrouver puis enchaîner avec `llm-wiki ingest`. **N'invente pas un problème d'auth Discord, le fichier est déjà sur disque.**
+- Lien web public → `llm-wiki ingest <url>` directement (web_extract upstream).
+- Transcript voix Craig → `craig-pipeline` automatique.
 - Question pure lecture (« résume les 50 derniers messages ») → réponds en direct, n'écris rien.
 
 ## Comment l'invoquer
