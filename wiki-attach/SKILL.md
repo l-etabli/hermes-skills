@@ -78,35 +78,56 @@ ls -lh /opt/data/cache/documents/doc_xxx_<filename>
 
 Le bridge a deja filtre sur `SUPPORTED_DOCUMENT_TYPES` (incluant `.pdf`) et capote a 32 MB par fichier. Si le fichier est absent du cache, c'est probablement un type non supporte ou un overflow taille — surface l'erreur, n'essaie pas de re-telecharger depuis Discord.
 
-### 3. Activer le skill `llm-wiki` et invoquer son operation `ingest`
+### 3. Extraire le contenu avec le tool `web_extract`
 
-**NE PAS** reimplementer l'ingest en Python heredoc. **NE PAS** copier le PDF dans `raw/papers/` a la main. Active le skill `llm-wiki` (`skill_view: llm-wiki`) et applique son operation `ingest` sur chaque chemin cache, dans l'ordre :
+**`llm-wiki` n'est PAS une CLI.** Il n'existe **aucun binaire `llm-wiki` dans le PATH** — c'est un **playbook** (cf. `skills/research/llm-wiki/SKILL.md` upstream) que tu dois derouler avec **tes propres tools Hermes**, pas via un appel shell.
+
+Pour extraire le texte/contenu d'un PDF (ou d'un .docx, .pptx, ...), invoque le **tool `web_extract`** d'Hermes sur le chemin local cache :
 
 ```
-llm-wiki ingest /opt/data/cache/documents/doc_<uuid>_<file1>.pdf
-llm-wiki ingest /opt/data/cache/documents/doc_<uuid>_<file2>.pdf
+web_extract(url="/opt/data/cache/documents/doc_<uuid>_<file1>.pdf")
+web_extract(url="/opt/data/cache/documents/doc_<uuid>_<file2>.pdf")
 ```
 
-Le skill `llm-wiki` se charge de :
-- Copier dans `raw/papers/` (ou `raw/articles/` selon le type) avec frontmatter sha256 + ingested timestamp,
-- Decider de la creation/mise a jour de pages `entities/` / `concepts/` selon les seuils de `SCHEMA.md`,
-- Appender a `log.md`,
-- Commit + push sur le repo `kb-<instance>`.
+`web_extract` accepte les paths locaux **ET** les URLs (cf. SKILL.md upstream `llm-wiki` § Core Operations / Ingest etape ① : « PDF → use `web_extract` (handles PDFs), save to `raw/papers/` »). Sous le capot c'est le modele auxiliaire `auxiliary.web_extract` (typiquement gemini-2.5-flash, multimodal, cheap, gere bien les PDFs natifs).
 
-### 4. Confirmer en Discord
+**Anti-patterns observes en prod le 2026-04-28 sur Telluris (haiku-4.5)** — ne fais PAS :
+- `pip install pypdf` / `pip install PyMuPDF` / `pip install fitz` -> pollue le container, ne survit pas au restart, et c'est inutile (web_extract gere les PDFs).
+- `pdftotext -layout ...` -> n'est meme pas installe par defaut, et meme si c'etait le cas, web_extract est un meilleur passage (preserve la structure + multimodal).
+- `python3 -c "import fitz; ..."` heredoc -> idem, contournement inutile.
+- `browser_navigate file:///opt/data/wiki/raw/papers/...pdf` -> le browser ne rend pas les PDFs proprement, et ca consomme un browser session pour rien.
+- `convert -density 150 ...pdf ...png` puis `vision_analyze` page par page -> tres lent, perd le texte vectoriel selectable, et c'est exactement ce que web_extract fait deja en interne mais en mieux.
+- Tenter d'invoquer `llm-wiki ingest <path>` au shell -> commande inexistante, retourne "command not found".
 
-**Une seule fois, a la fin**, apres que TOUS les ingest ont reussi : poste un court message qui liste les pages wiki creees ou mises a jour, et le commit URL renvoye par `llm-wiki ingest`.
+### 4. Derouler l'ingest llm-wiki inline
 
-**Ne termine PAS un tour sur un message d'annonce** (« Je vais maintenant ingerer... ») sans avoir lance le tool call qui suit. Cf. `AGENTS.md` § Anti-pattern 7 (vu en prod 2026-04-27 sur craig-transcript-record).
+Une fois le texte extrait via `web_extract`, applique les **6 etapes du playbook `llm-wiki` ingest** (cf. `skill_view: llm-wiki`, section "Core Operations / 1. Ingest") :
 
-## Pitfalls
+① **Capture raw** : ecris le markdown extrait dans `$WIKI_PATH/raw/papers/<descriptive-name>.md` avec frontmatter (`source_url: discord-attachment`, `ingested: YYYY-MM-DD`, `sha256: <body-hash>`). Optionnellement copie le PDF original a cote (`<descriptive-name>.pdf`) si la ré-inspection visuelle peut etre utile plus tard.
+② **(Skippable en mode auto)** Discuter takeaways avec l'utilisateur — si la demande est explicitement « ingere ces docs » sans question, passe directement a ③.
+③ **Check existing** : `search_files` dans `$WIKI_PATH/index.md` + grep pour les entites/concepts mentionnes (ex: « Peloton », « HGE », « Wellview ») — eviter les doublons.
+④ **Write/update** pages `entities/` et `concepts/` selon les seuils de `SCHEMA.md` (≥ 2 mentions ou central a la source). Frontmatter complet, wikilinks (≥ 2 sortants par page), tags depuis la taxonomie SCHEMA, provenance `^[raw/papers/<file>.md]` quand 3+ sources.
+⑤ **Update navigation** : ajouter les nouvelles pages a `index.md` + appender a `log.md` (`## [YYYY-MM-DD] ingest | <Source Title>` avec liste des fichiers crees/modifies).
+⑥ **Commit + push** depuis `$WIKI_PATH` (`git add . && git commit -m "ingest: <source>" && git push`). Le token est dans `$GITHUB_TOKEN` (refresh sidecar 45m).
 
-- **Le browser est inutile** : pas de `browser_navigate` sur discord.com, ca tombe sur la page de login systematiquement. Le fichier est deja sur disque.
-- **Pas de re-download via curl** : meme si tu reussissais a extraire l'URL CDN du message, le bridge l'a deja fait pour toi avec auth. Re-fetcher serait redondant et echouerait sur les attachments expires.
-- **N'invoque pas `wiki-quick`** : ce skill ne gere que du texte. Sa propre contre-indication te renvoie ici.
-- **Plusieurs fichiers** : ingere-les **un par un** avec un tool call separe par fichier — `llm-wiki ingest` ne prend qu'un path a la fois.
-- **Si le fichier n'apparait pas dans le cache** : surface explicitement « le fichier `<name>` n'est pas dans `/opt/data/cache/documents/`, le bridge l'a probablement filtre (type non supporte, > 32 MB) ». N'invente pas le contenu, ne demande pas a l'utilisateur de le re-uploader.
+Pour chaque etape, utilise tes tools natifs (`terminal` pour les ecritures fs et git, `search_files` pour la recherche) — **pas** de subagent / `delegate_task`. Le subagent rallonge le temps et casse la traçabilite Discord (l'utilisateur ne voit plus ce que tu fais).
+
+### 5. Confirmer en Discord
+
+**Une seule fois, a la fin**, apres que tous les commits ont push : poste un court message listant les pages wiki creees/mises a jour et l'URL du commit GitHub.
+
+**Ne termine PAS un tour sur un message d'annonce** (« Je vais maintenant ingerer... ») sans avoir lance le tool call qui suit. Cf. `AGENTS.md` § Anti-pattern 7 (vu en prod 2026-04-27 sur craig-transcript-record, et reproduit le 2026-04-28 sur ce meme skill).
+
+## Pitfalls (recap des modes d'echec observes)
+
+- **Le browser est inutile** sur discord.com — page de login systematique. Le fichier est sur disque local.
+- **Pas de re-download via curl** depuis l'URL CDN — le bridge l'a deja fait avec auth, les liens CDN expirent vite.
+- **N'invoque pas `wiki-quick`** — ce skill ne gere que du texte. Sa contre-indication te renvoie ici.
+- **Plusieurs fichiers** : extrais et traite-les sequentiellement, pas en parallele (eviter race conditions sur git commit / `log.md`).
+- **Si le fichier n'apparait pas dans le cache** : surface explicitement « le fichier `<name>` n'est pas dans `/opt/data/cache/documents/`, le bridge l'a probablement filtre (type non supporte > SUPPORTED_DOCUMENT_TYPES, ou taille > 32 MB) ». N'invente pas le contenu, ne demande pas le re-upload sans cette analyse prealable.
+- **Pas de subagent** : `delegate_task` rend le LLM aveugle a son propre travail (vu en prod le 2026-04-28 : subagent est parti en boucle 4+ minutes sans rendre la main). Ingest est sequentiel et debuggable, fais-le inline.
+- **Pas de skill auto-installe** : ne cree pas un skill custom `<inst>-wiki-ingest` via `skill_install` (vu sur Telluris, supprime le 2026-04-28). Si la procedure ici est insuffisante, edite ce fichier directement dans `l-etabli/hermes-skills` et push.
 
 ## Pourquoi pas un script `wiki_attach.py` dedie
 
-Tout le travail utile est deja fait par le skill `llm-wiki` upstream (qui inclut PDF text extraction, OCR si besoin, dedup via sha256, creation de pages). Ce skill `wiki-attach` est purement un **playbook** pour le LLM : il decrit ou trouver les fichiers et dans quel ordre invoquer `llm-wiki`. Pas de code Python a maintenir.
+L'ingest est un **playbook LLM** par construction : la valeur ajoutee est dans le jugement (quelles entites creer, quels wikilinks tracer, quelle taxonomie de tags appliquer) — pas dans le pipe shell deterministe. `web_extract` fait l'extraction, le LLM fait la synthese. Pas de code Python a maintenir.
