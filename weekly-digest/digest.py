@@ -151,6 +151,11 @@ def fetch_channel_messages(channel_id: str, since: datetime, hard_cap: int = 200
 
 # ----------------------------- openrouter -----------------------------
 
+LENGTH_CONSTRAINT = (
+    " Contrainte stricte : la réponse sera postée telle quelle sur Discord, "
+    "qui coupe à 2000 caractères. Reste sous **1800 caractères** total, sans exception."
+)
+
 PROMPTS = {
     "recap": (
         "Tu es l'assistant <instance>. Voici les messages des {days} derniers jours sur les "
@@ -158,6 +163,7 @@ PROMPTS = {
         "**3 bullets max** : ce qui a été DÉCIDÉ, ce qui a été LIVRÉ, ce qui est À NOTER. "
         "Ton sec, factuel, pas de remplissage. Cite des @auteurs si pertinent. "
         "Si rien de notable cette semaine, dis-le en 1 phrase."
+        + LENGTH_CONSTRAINT
     ),
     "briefing": (
         "Tu es l'assistant <instance>. Voici les messages des {days} derniers jours sur les "
@@ -165,6 +171,7 @@ PROMPTS = {
         "**OBJECTIFS** de la semaine, **ACTIONS REPRISES** du vendredi, **BLOCAGES** ouverts, "
         "**ÉCHÉANCES** proches. Prospectif et actionnable, pas un copier-coller du récap. "
         "Si trop peu de matière, propose 2-3 questions ouvertes pour cadrer la semaine."
+        + LENGTH_CONSTRAINT
     ),
 }
 
@@ -173,6 +180,7 @@ def call_openrouter(mode: str, days: int, transcript: str) -> tuple[str | None, 
     system = PROMPTS[mode].format(days=days).replace("<instance>", INSTANCE_NAME)
     body = {
         "model": OPENROUTER_MODEL,
+        "max_tokens": 700,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": transcript[:60000]},
