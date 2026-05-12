@@ -45,7 +45,7 @@ Les fichiers sont **deja la, sur disque, accessibles a ton tool `terminal`**. Cf
 
 Mode d'echec observe en prod le 2026-04-28 sur Telluris (modele gemini-3-flash-preview) : le LLM a halluciné un probleme d'auth, propose 3 workarounds inutiles, et a oublie d'aller voir `/opt/data/cache/documents/`. Ne reproduis pas.
 
-## Workflow LLM (4 etapes, sans message d'attente entre les tool calls)
+## Workflow LLM (5 etapes, sans message d'attente entre les tool calls)
 
 ### 1. Localiser les fichiers caches
 
@@ -78,9 +78,22 @@ ls -lh /opt/data/cache/documents/doc_xxx_<filename>
 
 Le bridge a deja filtre sur `SUPPORTED_DOCUMENT_TYPES` (incluant `.pdf`) et capote a 32 MB par fichier. Si le fichier est absent du cache, c'est probablement un type non supporte ou un overflow taille — surface l'erreur, n'essaie pas de re-telecharger depuis Discord.
 
-### 3. Extraire le contenu du PDF (ou doc) avec `pdftotext`
+### 3. Inspecter l'etat du repo wiki AVANT d'editer
 
-**`llm-wiki` n'est PAS une CLI.** Il n'existe aucun binaire `llm-wiki` dans le PATH — c'est un **playbook** (cf. `skills/research/llm-wiki/SKILL.md` upstream) que tu derouleras toi-meme inline a l'etape 4. **`web_extract` n'est PAS un tool agent non plus** — c'est un modele auxiliaire interne (cf. `config.yaml: auxiliary.web_extract`), pas dans ta toolbox. Idem : `vision_analyze` ne lit que les **vraies images** (jpg/png), pas les PDFs.
+```bash
+cd "$WIKI_PATH"
+git status --short --branch
+```
+
+Si le working tree est dirty (commits non pushes anciens, fichiers untracked non lies a cet ingest), **ne presuppose pas que tu pourras tout staging en bloc plus tard**. Trois choix :
+
+1. Si les fichiers dirty appartiennent a un autre ingest en cours -> **finis-le proprement** (commit + push) avant d'attaquer celui-ci.
+2. Si c'est du state runtime non lie (ex. `.craig-debriefs-pending/`, fichiers temporaires) -> **scope strict** : pour cet ingest tu ne stageras QUE les fichiers que tu crees/modifies toi-meme (etape 5 ⑥), pas `git add .`.
+3. Si tu ne comprends pas pourquoi le repo est dirty -> surface a l'utilisateur, ne masque pas le state inconnu en commitant tout.
+
+### 4. Extraire le contenu du PDF (ou doc) avec `pdftotext`
+
+**`llm-wiki` n'est PAS une CLI.** Il n'existe aucun binaire `llm-wiki` dans le PATH — c'est un **playbook** (cf. `skills/research/llm-wiki/SKILL.md` upstream) que tu derouleras toi-meme inline a l'etape 5. **`web_extract` n'est PAS un tool agent non plus** — c'est un modele auxiliaire interne (cf. `config.yaml: auxiliary.web_extract`), pas dans ta toolbox. Idem : `vision_analyze` ne lit que les **vraies images** (jpg/png), pas les PDFs.
 
 **Le bon chemin dans cet environnement est `pdftotext`** (binaire poppler-utils). Il est present dans l'image extras hermes-agent-extras (cf. `hermes-infra/AGENTS.md` § "Image extras"). Invoque-le via `terminal` :
 
@@ -122,7 +135,7 @@ for i, page in enumerate(r.pages):
 - ❌ `delegate_task` / subagent -> proscrit pour cet ingest, cf. § Pitfalls.
 - ❌ Tenter `llm-wiki ingest <path>` au shell -> commande inexistante.
 
-### 4. Derouler l'ingest llm-wiki inline
+### 5. Derouler l'ingest llm-wiki inline
 
 Une fois le texte extrait, applique les **6 etapes du playbook `llm-wiki` ingest** (cf. `skill_view: llm-wiki`, section "Core Operations / 1. Ingest") :
 
@@ -131,11 +144,16 @@ Une fois le texte extrait, applique les **6 etapes du playbook `llm-wiki` ingest
 ③ **Check existing** : `search_files` dans `$WIKI_PATH/index.md` + grep pour les entites/concepts mentionnes (ex: « Peloton », « HGE », « Wellview ») — eviter les doublons.
 ④ **Write/update** pages `entities/` et `concepts/` selon les seuils de `SCHEMA.md` (≥ 2 mentions ou central a la source). Frontmatter complet, wikilinks (≥ 2 sortants par page), tags depuis la taxonomie SCHEMA, provenance `^[raw/papers/<file>.md]` quand 3+ sources.
 ⑤ **Update navigation** : ajouter les nouvelles pages a `index.md` + appender a `log.md` (`## [YYYY-MM-DD] ingest | <Source Title>` avec liste des fichiers crees/modifies).
-⑥ **Commit + push** depuis `$WIKI_PATH` (`git add . && git commit -m "ingest: <source>" && git push`). Le token est dans `$GITHUB_TOKEN` (refresh sidecar 45m).
+⑥ **Commit + push** depuis `$WIKI_PATH`. Le token est dans `$GITHUB_TOKEN` (refresh sidecar 45m).
+
+- **Staging selectif, pas `git add .`** : ne stage QUE les fichiers que tu as crees/modifies pour cet ingest (raw, entities/concepts touches, `index.md`, `log.md`). Cf. etape 3 — si le repo etait dirty avec du state non lie, `git add .` polluerait ton commit avec ce state.
+- **Verification remote avant push** : si le repo a recemment montre des sync issues (push qui foire, ou tu vois l'instance pour la premiere fois apres une migration), un `git remote -v` rapide te dit sur quoi tu pousses. Skip si l'instance push normalement depuis des semaines.
+- `git commit -m "ingest: <source>"` puis `git push`.
+- **Si `git push` echoue** : ne perds pas l'ingest. Surface a l'utilisateur le commit hash local (`git rev-parse HEAD`) et l'URL remote (`git remote get-url origin`) pour qu'il puisse fixer l'auth/wiring du repo. L'ingest est commite localement, il sera pushe au prochain push reussi.
 
 Pour chaque etape, utilise tes tools natifs (`terminal` pour les ecritures fs et git, `search_files` pour la recherche) — **pas** de subagent / `delegate_task`. Le subagent rallonge le temps et casse la traçabilite Discord (l'utilisateur ne voit plus ce que tu fais).
 
-### 5. Confirmer en Discord
+### 6. Confirmer en Discord
 
 **Une seule fois, a la fin**, apres que tous les commits ont push : poste un court message listant les pages wiki creees/mises a jour et l'URL du commit GitHub.
 

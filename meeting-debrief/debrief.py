@@ -27,8 +27,9 @@ Optional env: MEETING_DEBRIEF_MIN_DURATION_S (default 180).
 
 Output (single JSON object on stdout):
   {"status": "posted",
-   "thread_id": "...", "message_id": "...",
-   "channel_id": "...", "action_count": N,
+   "thread_id": "...", "parent_message_id": "...",
+   "actions_message_id": "...", "channel_id": "...",
+   "action_count": N, "chunks_posted": N,
    "debrief_path": "raw/debriefs/...json"}
   {"status": "skipped", "reason": "too-short|already-debriefed|no-actions",
    "detail": "..."}
@@ -44,6 +45,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -182,19 +184,47 @@ def discord_post(path: str, body: dict) -> tuple[dict | None, str | None]:
         return None, f"discord-bad-json: {r.text[:200]}"
 
 
-def truncate_recap(recap: str, max_len: int = DISCORD_CONTENT_MAX) -> str:
-    """Hard-truncate the recap to fit Discord's content cap, preserving
-    the structure as much as possible. Adds a footer marker so the LLM /
-    user knows the recap was cut. The full version remains in
-    raw/debriefs/<slug>.json for archival."""
-    if len(recap) <= max_len:
-        return recap
-    marker = "\n\n_(recap tronqué — voir `raw/debriefs/` pour la version complète)_"
-    cut = max_len - len(marker)
-    if cut < 100:
-        # max_len is absurdly small; take what we can.
-        return recap[:max_len]
-    return recap[:cut].rstrip() + marker
+def split_recap(recap: str, max_chunk: int = DISCORD_CONTENT_MAX) -> list[str]:
+    """Split the recap into one or more Discord messages of ≤ max_chunk
+    chars. Splits at section boundaries (`### ...`).
+
+    The "Actions proposées" section is always emitted as its OWN chunk:
+    dispatch.py edits it in place to add ✅/❌ marks, so it must fit in
+    a single message. If that section alone exceeds max_chunk (rare,
+    given the LLM prompt caps the full recap at ~3500), it is hard-cut
+    with a footer marker — the full version remains in raw/debriefs/."""
+    if len(recap) <= max_chunk:
+        return [recap]
+
+    parts = re.split(r"(?=^### )", recap, flags=re.MULTILINE)
+    parts = [p.rstrip() for p in parts if p.strip()]
+
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        is_actions = part.startswith("### Actions")
+        if is_actions:
+            if current:
+                chunks.append(current.rstrip())
+                current = ""
+            if len(part) > max_chunk:
+                marker = "\n_(actions tronquées — voir `raw/debriefs/` pour la version complète)_"
+                part = part[: max_chunk - len(marker)].rstrip() + marker
+            chunks.append(part)
+            continue
+        candidate = (current + "\n\n" + part).strip() if current else part
+        if len(candidate) <= max_chunk:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current.rstrip())
+                current = part if len(part) <= max_chunk else part[:max_chunk].rstrip()
+            else:
+                chunks.append(part[:max_chunk].rstrip())
+                current = ""
+    if current:
+        chunks.append(current.rstrip())
+    return chunks
 
 
 def main() -> int:
@@ -260,25 +290,47 @@ def main() -> int:
 
     actions = debrief.get("action_items") or []
     full_recap_md = format_recap(debrief, transcript_rel)
-    recap_md = truncate_recap(full_recap_md)
+    recap_chunks = split_recap(full_recap_md)
 
-    msg, err = discord_post(
-        f"/channels/{DISCORD_HOME_CHANNEL}/messages",
-        {"content": recap_md},
-    )
-    if err:
-        emit({"status": "error", "reason": "discord-post-recap", "detail": err})
-        return 1
-    message_id = msg["id"]
+    parent_message_id: str | None = None
+    actions_message_id: str | None = None
+    actions_message_content: str | None = None
+    last_message_id: str | None = None
+    for i, chunk in enumerate(recap_chunks):
+        msg, err = discord_post(
+            f"/channels/{DISCORD_HOME_CHANNEL}/messages",
+            {"content": chunk},
+        )
+        if err:
+            emit({"status": "error", "reason": "discord-post-recap",
+                  "detail": err, "chunk_index": i,
+                  "chunks_posted": i,
+                  "parent_message_id": parent_message_id})
+            return 1
+        mid = msg["id"]
+        if i == 0:
+            parent_message_id = mid
+        if chunk.lstrip().startswith("### Actions"):
+            actions_message_id = mid
+            actions_message_content = chunk
+        last_message_id = mid
+
+    # If no chunk started with "### Actions" (e.g. actions were absent or
+    # the section title was rephrased by the formatter), fall back to the
+    # last message — dispatch.py's annotate is a no-op on text without
+    # numbered action lines, so this stays safe.
+    if not actions_message_id:
+        actions_message_id = last_message_id
+        actions_message_content = recap_chunks[-1]
 
     thread, err = discord_post(
-        f"/channels/{DISCORD_HOME_CHANNEL}/messages/{message_id}/threads",
+        f"/channels/{DISCORD_HOME_CHANNEL}/messages/{parent_message_id}/threads",
         {"name": f"Debrief {transcript_rel.split('/')[-1]}"[:90],
          "auto_archive_duration": 1440},
     )
     if err:
         emit({"status": "error", "reason": "discord-create-thread",
-              "detail": err, "message_id": message_id})
+              "detail": err, "parent_message_id": parent_message_id})
         return 1
     thread_id = thread["id"]
 
@@ -295,12 +347,13 @@ def main() -> int:
     pending = {
         "thread_id": thread_id,
         "channel_id": DISCORD_HOME_CHANNEL,
-        "message_id": message_id,
+        "parent_message_id": parent_message_id,
+        "actions_message_id": actions_message_id,
+        "actions_message_content": actions_message_content,
         "transcript_path": transcript_rel,
         "debrief_path": str(debrief_path.relative_to(WIKI_PATH))
             if debrief_path.is_relative_to(WIKI_PATH) else str(debrief_path),
         "transcript_sha256": sha,
-        "recap_markdown": recap_md,
         "action_items": actions,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -317,7 +370,7 @@ def main() -> int:
     if err:
         emit({"status": "error", "reason": "discord-post-thread-prompt",
               "detail": err, "thread_id": thread_id,
-              "message_id": message_id,
+              "parent_message_id": parent_message_id,
               "pending_path": str(pending_path.relative_to(WIKI_PATH))})
         return 1
 
@@ -327,17 +380,21 @@ def main() -> int:
         except OSError:
             pass
         emit({"status": "posted", "reason": "no-actions",
-              "thread_id": thread_id, "message_id": message_id,
+              "thread_id": thread_id,
+              "parent_message_id": parent_message_id,
               "channel_id": DISCORD_HOME_CHANNEL,
               "action_count": 0,
+              "chunks_posted": len(recap_chunks),
               "debrief_path": pending["debrief_path"]})
         return 0
 
     emit({"status": "posted",
           "thread_id": thread_id,
-          "message_id": message_id,
+          "parent_message_id": parent_message_id,
+          "actions_message_id": actions_message_id,
           "channel_id": DISCORD_HOME_CHANNEL,
           "action_count": len(actions),
+          "chunks_posted": len(recap_chunks),
           "debrief_path": pending["debrief_path"]})
     return 0
 

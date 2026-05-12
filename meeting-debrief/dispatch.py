@@ -208,18 +208,19 @@ def main() -> int:
             action = apply_correction(action, override)
         to_invoke.append(action)
 
-    recap_md = pending.get("recap_markdown") or ""
-    if recap_md:
-        new_recap = annotate_recap(recap_md, validated, refused)
-        if new_recap != recap_md:
+    actions_msg = pending.get("actions_message_content") or ""
+    actions_mid = pending.get("actions_message_id")
+    if actions_msg and actions_mid:
+        new_actions_msg = annotate_recap(actions_msg, validated, refused)
+        if new_actions_msg != actions_msg:
             err = discord_patch_message(
-                pending["channel_id"], pending["message_id"], new_recap,
+                pending["channel_id"], actions_mid, new_actions_msg,
             )
             if err:
                 emit({"status": "error", "reason": "discord-patch-recap",
                       "detail": err})
                 return 1
-            pending["recap_markdown"] = new_recap
+            pending["actions_message_content"] = new_actions_msg
 
     remaining = [a for a in actions if int(a["id"]) not in (validated | refused)]
     pending["action_items"] = remaining

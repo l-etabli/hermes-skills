@@ -165,9 +165,9 @@ Quand tu reçois un message Discord :
    ' "$WIKI_PATH/raw/debriefs/<file>.json"
    ```
 
-2. Un message est visible dans `DISCORD_HOME_CHANNEL` avec le recap markdown.
-3. Un thread est ouvert sous ce message, contenant le prompt de validation.
-4. `$WIKI_PATH/.craig-debriefs-pending/<thread_id>.json` existe avec les `action_items`, `recap_markdown`, `transcript_sha256`.
+2. Un ou plusieurs messages sont visibles dans `DISCORD_HOME_CHANNEL` avec le recap markdown. Si le debrief dépasse ~1900 chars, il est splitté en plusieurs messages aux frontières de section (`### TLDR` / `### Décisions` / `### Questions ouvertes` / `### Actions proposées`) ; la section `Actions` est toujours dans son propre message pour que dispatch.py puisse l'éditer sur place.
+3. Un thread est ouvert sous le PREMIER message (`parent_message_id`), contenant le prompt de validation.
+4. `$WIKI_PATH/.craig-debriefs-pending/<thread_id>.json` existe avec `action_items`, `actions_message_id`, `actions_message_content`, `parent_message_id`, `transcript_sha256`.
 5. Relance manuelle de `debrief.py --debrief-path <même path>` → `skipped/already-debriefed`.
 
 ### Phase 2

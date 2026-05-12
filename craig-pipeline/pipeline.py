@@ -1145,13 +1145,24 @@ JSON STRICT conforme au schéma fourni. Règles absolues :
   user message. Tu n'inventes RIEN qui ne soit textuellement dans le
   transcript : pas d'entité, pas de personne, pas d'action, pas de
   décision, pas de date.
+- **Langue de sortie** : tu rédiges TOUS les champs textuels (`tldr`,
+  `decisions`, `open_questions`, `action_items[].description`) dans la
+  MÊME LANGUE que le transcript. Transcript en français → debrief en
+  français. Anglais → anglais. Transcript multilingue → langue
+  dominante. Ne traduis JAMAIS vers l'anglais "par défaut".
+- **Couvre l'intégralité du transcript** : les décisions stratégiques,
+  business, ou gouvernance arrivent souvent en fin de conversation,
+  après la partie technique. Analyse jusqu'au dernier message — ne
+  t'arrête pas aux premiers segments.
 - Si le transcript ne contient AUCUNE action concrète (smalltalk,
   brainstorming sans engagement, test technique, recording silencieux),
   retourne `"action_items": []`. UN debrief vide est meilleur qu'UN
   debrief halluciné.
 - Le `tldr` doit être 2-5 puces markdown, courtes. Le recap markdown
   rendu côté Discord (TLDR + decisions + open_questions + actions) doit
-  rester sous ~1800 chars : sois concis.
+  rester sous ~3500 chars : reste concis, mais n'élague pas une décision
+  importante pour gagner 50 chars. Le rendu Discord splittera en
+  plusieurs messages si nécessaire.
 - Pour chaque action_item : `id` 1-based unique, `type` ∈ taxonomie du
   schema, `suggested_action.kind` ∈ enum schema, `target` inféré
   raisonnablement (préfère un repo plausible owner/repo, un email
