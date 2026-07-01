@@ -61,7 +61,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN", "CRAIG_EVENTS_CHANNEL_ID")
+REQUIRED_ENV = ("WIKI_PATH", "CRAIG_DISCORD_BOT_TOKEN", "CRAIG_EVENTS_CHANNEL_ID")
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
 if _missing:
     print(json.dumps({"status": "error", "reason": "missing-env",
@@ -92,10 +92,10 @@ DISCORD_API = "https://discord.com/api/v10"
 
 def fetch_recent_messages() -> tuple[list[dict], str | None]:
     """List the most recent messages of #craig-events. Returns (msgs, err)."""
-    token = os.environ.get("DISCORD_BOT_TOKEN")
+    token = os.environ.get("CRAIG_DISCORD_BOT_TOKEN")
     channel_id = os.environ.get("CRAIG_EVENTS_CHANNEL_ID")
     if not token or not channel_id:
-        return [], "missing DISCORD_BOT_TOKEN or CRAIG_EVENTS_CHANNEL_ID env"
+        return [], "missing CRAIG_DISCORD_BOT_TOKEN or CRAIG_EVENTS_CHANNEL_ID env"
 
     import urllib.request
     import urllib.error

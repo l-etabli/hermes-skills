@@ -13,8 +13,8 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Chemin absolu vers le vault llm-wiki. Utilisé pour stocker l'état pending dans .craig-pending/ et hérité par craig-transcript-record."
     required_for: full functionality
-  - name: DISCORD_BOT_TOKEN
-    prompt: "Token du bot Discord de cette instance Hermes. Utilisé pour la self-discovery du message_id via l'API REST (le LLM ne sait pas extraire les IDs de son contexte de façon fiable)."
+  - name: CRAIG_DISCORD_BOT_TOKEN
+    prompt: "Token du bot Discord dédié aux skills Craig. Utilisé pour la self-discovery du message_id via l'API REST (le LLM ne sait pas extraire les IDs de son contexte de façon fiable)."
     required_for: full functionality
   - name: CRAIG_EVENTS_CHANNEL_ID
     prompt: "ID du canal Discord #craig-events de cette instance. Utilisé par la self-discovery pour trouver le message Craig correspondant à un Recording ID donné."
@@ -106,7 +106,7 @@ r = subprocess.run(
 print(r.stdout)
 ```
 
-C'est tout. Le script va chercher le dernier msg Craig dans `#craig-events` via API (`CRAIG_EVENTS_CHANNEL_ID` + `DISCORD_BOT_TOKEN` env), parse Components V2, extrait le Recording ID, écrit le pending.
+C'est tout. Le script va chercher le dernier msg Craig dans `#craig-events` via API (`CRAIG_EVENTS_CHANNEL_ID` + `CRAIG_DISCORD_BOT_TOKEN` env), parse Components V2, extrait le Recording ID, écrit le pending.
 
 **N'essaie PAS de** :
 - ❌ passer `--message` / `--message-file` / `--channel-id` / `--message-id` — ces flags n'existent plus, le script va rejeter avec argparse error.

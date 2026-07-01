@@ -13,8 +13,8 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Chemin absolu vers le vault llm-wiki. Le pipeline lit .craig-pending/, écrit raw/transcripts/, raw/debriefs/, .craig-pipeline-debug/."
     required_for: full functionality
-  - name: DISCORD_BOT_TOKEN
-    prompt: "Token bot Discord pour POST/PATCH le status message + GET du panel Craig."
+  - name: CRAIG_DISCORD_BOT_TOKEN
+    prompt: "Token du bot Discord dédié aux skills Craig pour POST/PATCH le status message + GET du panel Craig."
     required_for: full functionality
   - name: CRAIG_EVENTS_CHANNEL_ID
     prompt: "ID du canal #craig-events (où le status message live edité est posté en reply au panel Craig)."

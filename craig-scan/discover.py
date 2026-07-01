@@ -24,7 +24,7 @@ Pipeline:
      - $WIKI_PATH/.craig-pending/<id>.json (already being watched by craig-watch)
   4. Emit a JSON list of candidates so the LLM can present and confirm.
 
-Required env: WIKI_PATH, DISCORD_BOT_TOKEN, CRAIG_EVENTS_CHANNEL_ID.
+Required env: WIKI_PATH, CRAIG_DISCORD_BOT_TOKEN, CRAIG_EVENTS_CHANNEL_ID.
 
 Output (single JSON object on stdout):
   {
@@ -55,7 +55,7 @@ from datetime import datetime
 
 import requests
 
-REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN", "CRAIG_EVENTS_CHANNEL_ID")
+REQUIRED_ENV = ("WIKI_PATH", "CRAIG_DISCORD_BOT_TOKEN", "CRAIG_EVENTS_CHANNEL_ID")
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
 if _missing:
     print(json.dumps({"status": "error", "reason": "missing-env",
@@ -66,7 +66,7 @@ if _missing:
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 TRANSCRIPTS_DIR = WIKI_PATH / "raw" / "transcripts"
 PENDING_DIR = WIKI_PATH / ".craig-pending"
-DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+CRAIG_DISCORD_BOT_TOKEN = os.environ["CRAIG_DISCORD_BOT_TOKEN"]
 CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
 
 DISCORD_API = "https://discord.com/api/v10"
@@ -152,7 +152,7 @@ def pending_ids() -> set[str]:
 def main() -> int:
     r = requests.get(
         f"{DISCORD_API}/channels/{CHANNEL_ID}/messages",
-        headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+        headers={"Authorization": f"Bot {CRAIG_DISCORD_BOT_TOKEN}"},
         params={"limit": 100},
         timeout=30,
     )
@@ -176,7 +176,7 @@ def main() -> int:
     guild_id = None
     ch_resp = requests.get(
         f"{DISCORD_API}/channels/{CHANNEL_ID}",
-        headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+        headers={"Authorization": f"Bot {CRAIG_DISCORD_BOT_TOKEN}"},
         timeout=15,
     )
     if ch_resp.ok:

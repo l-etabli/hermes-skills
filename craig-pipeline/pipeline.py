@@ -45,7 +45,7 @@ When .craig-pending/ becomes empty after the loop:
   - Post one ✅ in DISCORD_HOME_CHANNEL.
   - Self-remove the craig-watch-followup cron via `hermes cron remove`.
 
-Required env: WIKI_PATH, DISCORD_BOT_TOKEN, CRAIG_EVENTS_CHANNEL_ID,
+Required env: WIKI_PATH, CRAIG_DISCORD_BOT_TOKEN, CRAIG_EVENTS_CHANNEL_ID,
 DISCORD_HOME_CHANNEL, OPENROUTER_API_KEY.
 Optional env:
   HERMES_SKILLS_DIR (default /opt/data/skills-shared)
@@ -80,7 +80,7 @@ from jsonschema import Draft202012Validator
 
 REQUIRED_ENV = (
     "WIKI_PATH",
-    "DISCORD_BOT_TOKEN",
+    "CRAIG_DISCORD_BOT_TOKEN",
     "CRAIG_EVENTS_CHANNEL_ID",
     "DISCORD_HOME_CHANNEL",
     "OPENROUTER_API_KEY",
@@ -98,7 +98,7 @@ DEBUG_DIR = WIKI_PATH / ".craig-pipeline-debug"
 TRANSCRIPTS_DIR = WIKI_PATH / "raw" / "transcripts"
 DEBRIEFS_DIR = WIKI_PATH / "raw" / "debriefs"
 
-DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+CRAIG_DISCORD_BOT_TOKEN = os.environ["CRAIG_DISCORD_BOT_TOKEN"]
 CRAIG_EVENTS_CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
 DISCORD_HOME_CHANNEL = os.environ["DISCORD_HOME_CHANNEL"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -146,7 +146,7 @@ HALLUCINATION_RES = [
 
 def _discord_request(method: str, path: str, **kwargs) -> tuple[dict | None, str | None]:
     headers = {
-        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Authorization": f"Bot {CRAIG_DISCORD_BOT_TOKEN}",
         "User-Agent": DISCORD_USER_AGENT,
     }
     if "json" in kwargs:

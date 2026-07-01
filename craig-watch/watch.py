@@ -22,7 +22,7 @@ Each tick:
   5. If the entry is older than MAX_AGE_HOURS (24h), drops it as
      `expired` (Craig probably crashed or the recording was abandoned).
 
-Required env: WIKI_PATH, DISCORD_BOT_TOKEN.
+Required env: WIKI_PATH, CRAIG_DISCORD_BOT_TOKEN.
 Optional env: HERMES_SKILLS_DIR (default /opt/data/skills-shared),
               CRAIG_WATCH_MAX_AGE_HOURS (default 24).
 
@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 
 import requests
 
-REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN")
+REQUIRED_ENV = ("WIKI_PATH", "CRAIG_DISCORD_BOT_TOKEN")
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
 if _missing:
     print(json.dumps({"checked": 0, "processed": [], "skipped": [],
@@ -68,7 +68,7 @@ if _missing:
 
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 PENDING_DIR = WIKI_PATH / ".craig-pending"
-DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+CRAIG_DISCORD_BOT_TOKEN = os.environ["CRAIG_DISCORD_BOT_TOKEN"]
 
 SKILLS_ROOT = pathlib.Path(
     os.environ.get("HERMES_SKILLS_DIR", "/opt/data/skills-shared")
@@ -95,7 +95,7 @@ def fetch_message(channel_id: str, message_id: str) -> tuple[dict | None, str | 
         r = requests.get(
             f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}",
             headers={
-                "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                "Authorization": f"Bot {CRAIG_DISCORD_BOT_TOKEN}",
                 "User-Agent": DISCORD_USER_AGENT,
             },
             timeout=15,

@@ -13,8 +13,8 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Chemin absolu vers le vault llm-wiki. Utilisé pour la dédup contre raw/transcripts/ et .craig-pending/."
     required_for: full functionality
-  - name: DISCORD_BOT_TOKEN
-    prompt: "Token du bot Discord de cette instance Hermes. Utilisé pour lister l'historique de #craig-events via l'API REST."
+  - name: CRAIG_DISCORD_BOT_TOKEN
+    prompt: "Token du bot Discord dédié aux skills Craig. Utilisé pour lister l'historique de #craig-events via l'API REST."
     required_for: full functionality
   - name: CRAIG_EVENTS_CHANNEL_ID
     prompt: "ID Discord du #craig-events de cette instance. Clic droit sur le salon > Copier l'ID (Developer Mode ON)."
