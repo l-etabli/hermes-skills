@@ -14,8 +14,8 @@ Single entry point. Invoked by the `craig-watch-followup` cron tick — the
 LLM session that fires the cron does ONE thing: subprocess this script
 and report its JSON output. All orchestration (Discord status edits,
 git ops, llm-wiki ingest, debrief generation, debrief.py invocation,
-self-cron-removal) is handled here in code. Only ONE LLM call remains
-in the loop: generation of the debrief JSON via OpenRouter.
+self-cron-removal) is handled here in code. LLM calls are isolated
+behind explicit backends (Hermes subscription by default; OpenRouter fallback).
 
 Why deterministic: in production the LLM-as-orchestrator was observed
 committing without pushing, silently skipping ingest, vandalizing
@@ -36,7 +36,7 @@ For each pending entry in $WIKI_PATH/.craig-pending/*.json:
      Apply transactionally. Run guards (line-loss >30%, hallucination
      regex, file >5000 lines, >20 files touched). On guard fail: revert
      working tree, dump debug, continue (transcript stays committed).
-  5. Generate debrief JSON via OpenRouter (gemini-3-flash-preview),
+  5. Generate debrief JSON via the configured LLM backend,
      validate against schema.json, write to raw/debriefs/<basename>.json.
   6. Subprocess meeting-debrief/debrief.py to post the recap + thread.
   7. Delete the pending JSON.
@@ -51,6 +51,8 @@ Optional env:
   HERMES_SKILLS_DIR (default /opt/data/skills-shared)
   HERMES_CLI_PATH (default /opt/hermes/.venv/bin/hermes)
   LLM_WIKI_SKILL_PATH (default /opt/hermes/skills/research/llm-wiki/SKILL.md)
+  PIPELINE_LLM_BACKEND (hermes|openrouter; default hermes; debrief only)
+  PIPELINE_LLM_TIMEOUT_S (default 300)
   OPENROUTER_MODEL (default google/gemini-3-flash-preview)
   MEETING_DEBRIEF_MIN_DURATION_S (default 180; 10 in test)
   PIPELINE_INGEST_MAX_TURNS (default 30)
@@ -75,6 +77,13 @@ from datetime import datetime, timezone
 import requests
 import yaml
 from jsonschema import Draft202012Validator
+from llm_backend import (
+    LlmBackendConfig,
+    complete_text as llm_complete_text,
+    extract_json_object,
+    openrouter_chat,
+    validate_backend,
+)
 
 # ----------------------------- env / paths -----------------------------
 
@@ -112,6 +121,8 @@ LLM_WIKI_SKILL_PATH = pathlib.Path(
     os.environ.get("LLM_WIKI_SKILL_PATH", "/opt/hermes/skills/research/llm-wiki/SKILL.md")
 )
 
+PIPELINE_LLM_BACKEND = os.environ.get("PIPELINE_LLM_BACKEND", "hermes").strip().lower()
+PIPELINE_LLM_TIMEOUT_S = int(os.environ.get("PIPELINE_LLM_TIMEOUT_S", "300"))
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
 MIN_DURATION_S = int(os.environ.get("MEETING_DEBRIEF_MIN_DURATION_S", "180"))
 INGEST_MAX_TURNS = int(os.environ.get("PIPELINE_INGEST_MAX_TURNS", "30"))
@@ -120,6 +131,22 @@ INGEST_MAX_TOOL_CALLS = int(os.environ.get("PIPELINE_INGEST_MAX_TOOL_CALLS", "50
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_USER_AGENT = "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
+
+_backend_err = validate_backend(PIPELINE_LLM_BACKEND)
+if _backend_err:
+    print(json.dumps({"status": "error", "reason": "invalid-llm-backend",
+                      "detail": _backend_err}, ensure_ascii=False))
+    sys.exit(2)
+
+LLM_CONFIG = LlmBackendConfig(
+    backend=PIPELINE_LLM_BACKEND,
+    hermes_cli=HERMES_CLI,
+    cwd=WIKI_PATH,
+    timeout_s=PIPELINE_LLM_TIMEOUT_S,
+    openrouter_api_key=OPENROUTER_API_KEY,
+    openrouter_api=OPENROUTER_API,
+    openrouter_model=OPENROUTER_MODEL,
+)
 
 FOLLOWUP_CRON_NAME = "craig-watch-followup"
 
@@ -519,42 +546,6 @@ def github_link(repo: pathlib.Path, sha: str) -> str:
     return f"https://github.com/{m.group(1)}/commit/{sha}"
 
 
-# ----------------------------- openrouter -----------------------------
-
-def openrouter_chat(messages: list[dict], tools: list[dict] | None = None,
-                    response_format: dict | None = None,
-                    model: str | None = None) -> tuple[dict | None, str | None]:
-    body: dict = {
-        "model": model or OPENROUTER_MODEL,
-        "messages": messages,
-    }
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
-    if response_format:
-        body["response_format"] = response_format
-    try:
-        r = requests.post(
-            OPENROUTER_API,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/l-etabli/hermes-skills",
-                "X-Title": "craig-pipeline",
-            },
-            json=body,
-            timeout=120,
-        )
-    except requests.RequestException as exc:
-        return None, f"network: {type(exc).__name__}: {exc}"
-    if not r.ok:
-        return None, f"openrouter-{r.status_code}: {r.text[:400]}"
-    try:
-        return r.json(), None
-    except ValueError:
-        return None, f"openrouter-bad-json: {r.text[:200]}"
-
-
 # ----------------------------- llm-wiki ingest -----------------------------
 
 INGEST_TOOLS = [
@@ -878,7 +869,7 @@ def _agent_loop(transcript_path: pathlib.Path) -> tuple[list[dict], str, str | N
     tool_calls_total = 0
 
     for turn in range(INGEST_MAX_TURNS):
-        resp, err = openrouter_chat(messages, tools=INGEST_TOOLS)
+        resp, err = openrouter_chat(LLM_CONFIG, messages, tools=INGEST_TOOLS)
         if err:
             return buffer, "llm-error", err
         try:
@@ -1189,23 +1180,22 @@ def generate_debrief(transcript_path: pathlib.Path, schema: dict) -> tuple[dict 
     validator = Draft202012Validator(schema)
     last_err: str | None = None
     for attempt in range(3):
-        resp, err = openrouter_chat(
+        content, err = llm_complete_text(
+            LLM_CONFIG,
             messages,
+            purpose="generate meeting debrief JSON",
             response_format={"type": "json_object"},
         )
         if err:
             last_err = err
             time.sleep(2 * (attempt + 1))
             continue
-        try:
-            content = resp["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            last_err = f"bad-response: {str(resp)[:300]}"
+        text, extract_err = extract_json_object(content or "")
+        if extract_err or not text:
+            last_err = extract_err or "no-json-object"
+            messages.append({"role": "assistant", "content": content or ""})
+            messages.append({"role": "user", "content": f"Ta réponse ne contenait pas d'objet JSON valide ({last_err}). Réessaie, JSON pur, pas de fence."})
             continue
-        # Strip a stray ```json fence if the model adds one despite instructions.
-        text = (content or "").strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE)
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -1508,7 +1498,7 @@ def process_pending(pending_path: pathlib.Path) -> dict:
         summary.update({"phase": "done-short"})
         return summary
 
-    post_phase("inprogress", "Génération debrief (OpenRouter)…")
+    post_phase("inprogress", f"Génération debrief ({PIPELINE_LLM_BACKEND})…")
 
     DEBRIEFS_DIR.mkdir(parents=True, exist_ok=True)
     debrief_path = DEBRIEFS_DIR / f"{transcript_abs.stem}.json"
