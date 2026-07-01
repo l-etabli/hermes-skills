@@ -21,6 +21,7 @@ Pipeline:
      be on Drive).
   3. Dedupe against:
      - $WIKI_PATH/raw/transcripts/*.md filenames matching `*-craig-<id>-*`
+     - $WIKI_PATH/raw/transcripts/*.md content containing `craig.horse/rec/<id>`
      - $WIKI_PATH/.craig-pending/<id>.json (already being watched by craig-watch)
   4. Emit a JSON list of candidates so the LLM can present and confirm.
 
@@ -46,6 +47,7 @@ Output (single JSON object on stdout):
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import pathlib
@@ -70,6 +72,10 @@ CRAIG_DISCORD_BOT_TOKEN = os.environ["CRAIG_DISCORD_BOT_TOKEN"]
 CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
 
 DISCORD_API = "https://discord.com/api/v10"
+DISCORD_HEADERS = {
+    "Authorization": f"Bot {CRAIG_DISCORD_BOT_TOKEN}",
+    "User-Agent": "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)",
+}
 RECORDING_ID_RE = re.compile(
     # Craig Components V2 writes `**Recording ID:** \`<id>\``: skip past
     # bold/code wrappers (** and backticks) before the id.
@@ -77,6 +83,7 @@ RECORDING_ID_RE = re.compile(
     re.IGNORECASE,
 )
 ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
+TRANSCRIPT_SOURCE_URL_RE = re.compile(r"craig\.horse/rec/([A-Za-z0-9_-]+)", re.IGNORECASE)
 STARTED_RE = re.compile(r"Started\s*:\s*([0-9:]+)", re.IGNORECASE)
 CHANNEL_NAME_RE = re.compile(
     # Craig prefixes the channel name with an invisible Unicode character
@@ -105,6 +112,22 @@ def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
+def component_texts(node: object) -> list[str]:
+    """Collect text-bearing fields from Discord Components V2 recursively."""
+    if isinstance(node, list):
+        return [text for child in node for text in component_texts(child)]
+    if not isinstance(node, dict):
+        return []
+
+    own_texts = [
+        node[field]
+        for field in ("content", "title", "description", "label", "value")
+        if isinstance(node.get(field), str) and node[field]
+    ]
+    child_texts = component_texts(node.get("components") or [])
+    return own_texts + child_texts
+
+
 def message_body(msg: dict) -> str:
     parts = [msg.get("content", "") or ""]
     for em in msg.get("embeds", []) or []:
@@ -124,22 +147,27 @@ def message_body(msg: dict) -> str:
         footer = (em.get("footer") or {}).get("text")
         if footer:
             parts.append(footer)
+    parts.extend(component_texts(msg.get("components") or []))
     return "\n".join(parts)
 
 
 def transcribed_ids() -> dict[str, str]:
-    """Map craig_id -> raw filename for every raw matching `*-craig-<id>-*.md`."""
+    """Map craig_id -> raw filename for transcripts already present."""
     out: dict[str, str] = {}
     if not TRANSCRIPTS_DIR.exists():
         return out
-    # Filename layout: <date>-craig-<id>-<slugified_date>.md, where <id>
-    # may contain `-` and `_`. Anchor on the trailing date+".md" so the
-    # capture stops cleanly at the boundary.
-    pat = re.compile(r"-craig-([A-Za-z0-9_-]+?)-\d{4}-\d{2}-\d{2}\.md$")
+    # Filename layout fallback: <date>-craig-<id>-<slugified_date>.md,
+    # where <id> may contain `-` and `_`. Anchor on the trailing date+".md"
+    # so the capture stops cleanly at the boundary.
+    filename_pat = re.compile(r"-craig-([A-Za-z0-9_-]+?)-\d{4}-\d{2}-\d{2}\.md$")
     for md in TRANSCRIPTS_DIR.glob("*.md"):
-        m = pat.search(md.name)
-        if m:
-            out[m.group(1)] = md.name
+        filename_match = filename_pat.search(md.name)
+        if filename_match:
+            out[filename_match.group(1)] = md.name
+
+        body = md.read_text(encoding="utf-8")
+        for source_url_match in TRANSCRIPT_SOURCE_URL_RE.finditer(body):
+            out[source_url_match.group(1)] = md.name
     return out
 
 
@@ -149,11 +177,23 @@ def pending_ids() -> set[str]:
     return {p.stem for p in PENDING_DIR.glob("*.json")}
 
 
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Discover finished Craig recordings in #craig-events that are not transcribed yet.",
+    )
+    ap.add_argument("--limit", type=int, default=100, help="Discord messages to fetch, max 100")
+    args = ap.parse_args()
+    if args.limit < 1 or args.limit > 100:
+        ap.error("--limit must be between 1 and 100")
+    return args
+
+
 def main() -> int:
+    args = parse_args()
     r = requests.get(
         f"{DISCORD_API}/channels/{CHANNEL_ID}/messages",
-        headers={"Authorization": f"Bot {CRAIG_DISCORD_BOT_TOKEN}"},
-        params={"limit": 100},
+        headers=DISCORD_HEADERS,
+        params={"limit": args.limit},
         timeout=30,
     )
     if r.status_code in (401, 403):
@@ -176,7 +216,7 @@ def main() -> int:
     guild_id = None
     ch_resp = requests.get(
         f"{DISCORD_API}/channels/{CHANNEL_ID}",
-        headers={"Authorization": f"Bot {CRAIG_DISCORD_BOT_TOKEN}"},
+        headers=DISCORD_HEADERS,
         timeout=15,
     )
     if ch_resp.ok:
