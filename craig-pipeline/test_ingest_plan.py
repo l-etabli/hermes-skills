@@ -107,6 +107,68 @@ class ParseEditPlanTest(unittest.TestCase):
         self.assertIn("too-many-edits", err)
 
 
+class DryRunEditsTest(unittest.TestCase):
+    def _reader(self, files):
+        return lambda path: files.get(path)
+
+    def test_drops_patch_overlapping_an_earlier_patch(self):
+        # Regression: live abort on 2026-07-01 — patch #2's find spanned
+        # the line patch #1 had already rewritten in index.md.
+        files = {"index.md": "- [[loic]] : Expert forage.\n- [[jerome]] : Lead dev.\n"}
+        edits = [
+            {"action": "patch", "path": "index.md",
+             "find": "- [[loic]] : Expert forage.",
+             "replace_with": "- [[loic]] : Expert forage et géothermie."},
+            {"action": "patch", "path": "index.md",
+             "find": "- [[loic]] : Expert forage.\n- [[jerome]] : Lead dev.",
+             "replace_with": "nope"},
+            {"action": "append", "path": "index.md", "content": "- [[well]]"},
+        ]
+
+        accepted, rejected = ingest_plan.dry_run_edits(edits, self._reader(files))
+
+        self.assertEqual([e["action"] for e in accepted], ["patch", "append"])
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("index.md", rejected[0])
+
+    def test_patch_matching_text_added_by_earlier_edit_is_kept(self):
+        files = {"log.md": "# Log\n"}
+        edits = [
+            {"action": "append", "path": "log.md", "content": "- new entry"},
+            {"action": "patch", "path": "log.md",
+             "find": "- new entry", "replace_with": "- new entry [[x]]"},
+        ]
+
+        accepted, rejected = ingest_plan.dry_run_edits(edits, self._reader(files))
+
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual(rejected, [])
+
+    def test_create_then_append_on_new_file(self):
+        edits = [
+            {"action": "create", "path": "concepts/x.md", "content": "# X"},
+            {"action": "append", "path": "concepts/x.md", "content": "more"},
+            {"action": "create", "path": "concepts/x.md", "content": "dup"},
+        ]
+
+        accepted, rejected = ingest_plan.dry_run_edits(edits, self._reader({}))
+
+        self.assertEqual([e["action"] for e in accepted], ["create", "append"])
+        self.assertIn("create but file exists", rejected[0])
+
+    def test_ops_on_missing_file_are_dropped(self):
+        edits = [
+            {"action": "append", "path": "nope.md", "content": "x"},
+            {"action": "patch", "path": "nope.md", "find": "a", "replace_with": "b"},
+            {"action": "replace", "path": "nope.md", "content": "y"},
+        ]
+
+        accepted, rejected = ingest_plan.dry_run_edits(edits, self._reader({}))
+
+        self.assertEqual(accepted, [])
+        self.assertEqual(len(rejected), 3)
+
+
 class BuildPlanMessagesTest(unittest.TestCase):
     def test_prompt_stays_under_argv_budget(self):
         files = {f"p{i}.md": "x" * 50_000 for i in range(ingest_plan.MAX_READS + 5)}

@@ -53,6 +53,10 @@ Règles strictes pour le plan d'édition :
 - Préfère `append`/`patch` à `replace` (replace écrase tout le fichier).
 - `patch` : `find` doit être une sous-chaîne EXACTE du fichier tel que
   fourni ci-dessus. Ne patche pas un fichier dont tu n'as pas le contenu.
+- Les patches sont appliqués DANS L'ORDRE : sur un même fichier, le
+  `find` d'un patch ne doit PAS chevaucher le texte modifié par un patch
+  précédent (sinon il ne matchera plus). Un `find` court et disjoint par
+  patch, ou un seul patch plus large.
 - `append`/`patch`/`replace` uniquement sur un fichier existant,
   `create` uniquement sur un fichier inexistant.
 - Si le transcript ne mérite pas d'ingest (smalltalk, test technique,
@@ -170,3 +174,60 @@ def parse_edit_plan(text: str) -> tuple[list[dict] | None, str | None, str | Non
                 return None, None, f"edit-{i}-missing-content"
         out.append(edit)
     return out, rationale, None
+
+
+def dry_run_edits(edits: list[dict], read_file) -> tuple[list[dict], list[str]]:
+    """Simulate the pipeline's sequential apply over in-memory contents
+    and drop edits that would fail — typically a patch whose `find` was
+    consumed by an earlier patch on the same file (observed live on
+    2026-07-01: 4 patches on index.md, #2's find spanned the line #1 had
+    rewritten, aborting the whole transactional apply).
+
+    `read_file(path) -> str | None` returns current content or None if
+    the file doesn't exist. Mirrors apply semantics: create/replace add
+    a trailing newline, append separates with one, patch replaces the
+    first occurrence. Returns (accepted, rejected_reasons)."""
+    contents: dict[str, str | None] = {}
+
+    def current(path: str) -> str | None:
+        if path not in contents:
+            contents[path] = read_file(path)
+        return contents[path]
+
+    accepted: list[dict] = []
+    rejected: list[str] = []
+    for edit in edits:
+        path = edit["path"]
+        action = edit["action"]
+        cur = current(path)
+        if action == "create":
+            if cur is not None:
+                rejected.append(f"{path}: create but file exists")
+                continue
+            content = edit["content"]
+            contents[path] = content if content.endswith("\n") else content + "\n"
+        elif action == "append":
+            if cur is None:
+                rejected.append(f"{path}: append but file missing")
+                continue
+            content = edit["content"]
+            if not content.endswith("\n"):
+                content += "\n"
+            sep = "" if (not cur or cur.endswith("\n")) else "\n"
+            contents[path] = cur + sep + content
+        elif action == "replace":
+            if cur is None:
+                rejected.append(f"{path}: replace but file missing")
+                continue
+            content = edit["content"]
+            contents[path] = content if content.endswith("\n") else content + "\n"
+        elif action == "patch":
+            if cur is None:
+                rejected.append(f"{path}: patch but file missing")
+                continue
+            if edit["find"] not in cur:
+                rejected.append(f"{path}: patch find absent (chevauche un edit précédent ?)")
+                continue
+            contents[path] = cur.replace(edit["find"], edit["replace_with"], 1)
+        accepted.append(edit)
+    return accepted, rejected

@@ -82,6 +82,7 @@ from jsonschema import Draft202012Validator
 from ingest_plan import (
     build_discovery_messages,
     build_plan_messages,
+    dry_run_edits,
     parse_edit_plan,
     parse_reads,
 )
@@ -1016,6 +1017,20 @@ def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
         summary["status"] = "llm-error"
         summary["reason"] = rationale
         return summary
+
+    # Dry-run the buffer against in-memory contents and drop edits the
+    # sequential apply would choke on (e.g. overlapping patches on the
+    # same file) — one bad edit shouldn't abort an otherwise-good ingest.
+    def _read_current(path: str) -> str | None:
+        abs_path = WIKI_PATH / path
+        if not abs_path.is_file():
+            return None
+        return abs_path.read_text(encoding="utf-8", errors="replace")
+
+    buffer, dropped = dry_run_edits(buffer, _read_current)
+    if dropped:
+        summary["dropped_edits"] = dropped
+
     if not buffer:
         summary["status"] = "no-op"
         summary["n_files"] = 0
