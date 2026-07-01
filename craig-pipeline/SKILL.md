@@ -1,7 +1,7 @@
 ---
 name: craig-pipeline
-description: "Orchestrateur déterministe Python qui pilote toute la chaîne post-Craig (refetch panel Discord -> scan.py -> push transcript -> ingest llm-wiki via agent loop bufferisé -> génération debrief via backend LLM configurable -> debrief.py post + thread). Tout le reste est code → push garanti, idempotence triviale, monitoring Discord granulaire à chaque phase. Invoqué uniquement par le cron craig-watch-followup."
-version: 1.1.0
+description: "Orchestrateur déterministe Python qui pilote toute la chaîne post-Craig (refetch panel Discord -> scan.py -> push transcript -> ingest llm-wiki bufferisé -> génération debrief -> debrief.py post + thread). Ingest et debrief passent par un backend LLM configurable (Hermes/subscription par défaut, OpenRouter en fallback). Tout le reste est code → push garanti, idempotence triviale, monitoring Discord granulaire à chaque phase. Invoqué uniquement par le cron craig-watch-followup."
+version: 1.2.0
 platforms: [linux]
 metadata:
   hermes:
@@ -23,8 +23,8 @@ required_environment_variables:
     prompt: "ID du canal humain où le recap meeting-debrief est posté (et le ✅ final quand .craig-pending/ se vide)."
     required_for: full functionality
   - name: OPENROUTER_API_KEY
-    prompt: "Clé API OpenRouter. Requise tant que l'agent loop d'ingest llm-wiki utilise OpenRouter ; la génération debrief via Hermes ne la consomme pas, sauf fallback PIPELINE_LLM_BACKEND=openrouter."
-    required_for: full functionality
+    prompt: "Clé API OpenRouter. Requise UNIQUEMENT si PIPELINE_LLM_BACKEND=openrouter (le backend hermes par défaut n'en a pas besoin — ingest et debrief passent par `hermes -z`)."
+    required_for: optional
   - name: GROQ_API_KEY
     prompt: "Hérité par scan.py (transcription Groq Whisper)."
     required_for: full functionality
@@ -44,10 +44,10 @@ required_environment_variables:
     prompt: "Chemin du CLI hermes (défaut /opt/hermes/.venv/bin/hermes). Utilisé pour `cron list` + `cron remove` quand .craig-pending/ se vide, et pour la génération debrief si PIPELINE_LLM_BACKEND=hermes."
     required_for: optional
   - name: PIPELINE_LLM_BACKEND
-    prompt: "Backend LLM pour générer raw/debriefs/*.json : hermes (défaut, utilise `hermes -z` et le provider configuré/OAuth) ou openrouter (fallback)."
+    prompt: "Backend LLM pour l'ingest llm-wiki ET la génération debrief : hermes (défaut, utilise `hermes -z` et le provider configuré/OAuth) ou openrouter (fallback). En mode hermes, l'ingest passe par un plan d'édition JSON en 2 phases (discovery -> plan, cf. ingest_plan.py) au lieu de l'agent loop à tools."
     required_for: optional
   - name: PIPELINE_LLM_TIMEOUT_S
-    prompt: "Timeout des appels LLM pipeline (debrief + agent loop OpenRouter d'ingest, défaut 300)."
+    prompt: "Timeout de chaque appel LLM pipeline (ingest + debrief, défaut 300)."
     required_for: optional
   - name: LLM_WIKI_SKILL_PATH
     prompt: "Chemin du SKILL.md llm-wiki upstream (défaut /opt/hermes/skills/research/llm-wiki/SKILL.md). Lu et injecté en system prompt de l'agent loop d'ingest. Si absent, le pipeline utilise un fallback brief minimal."
@@ -85,7 +85,7 @@ Avant ce skill, le LLM était orchestrateur direct (via les skills `craig-watch`
 - Le LLM **ment** sur ce qu'il a fait ("cron auto-créé" alors que faux).
 - **Pas de visibilité** pendant les 1-15 min de Drive poll + Groq → user en aveugle.
 
-Décision : passer à un orchestrateur Python déterministe. Les appels LLM sont isolés derrière des backends explicites (Hermes par défaut pour le debrief ; OpenRouter encore utilisé par l'ingest bufferisé). Tout le reste est code.
+Décision : passer à un orchestrateur Python déterministe. Les appels LLM (ingest + debrief) sont isolés derrière des backends explicites — Hermes/subscription par défaut, OpenRouter en fallback. Tout le reste est code.
 
 ## Architecture
 
@@ -102,8 +102,14 @@ Décision : passer à un orchestrateur Python déterministe. Les appels LLM sont
     ├─ 2. subprocess scan.py → progress[] streamé en live
     │       chaque event PATCHe le status message
     ├─ 3. git add transcript + commit + push (en code)
-    ├─ 4. llm-wiki ingest (agent loop bufferisé)
-    │       - read_file / list_dir / propose_edit / done
+    ├─ 4. llm-wiki ingest (bufferisé, jamais d'écriture LLM directe)
+    │       - backend hermes (défaut) : plan d'édition JSON en 2 phases
+    │         via `hermes -z` — discovery (tree + extrait transcript →
+    │         fichiers à lire) puis plan (contexte embarqué → edits JSON
+    │         bornés), cf. ingest_plan.py
+    │       - backend openrouter : agent loop à tools
+    │         read_file / list_dir / propose_edit / done
+    │       - les deux passent par la même validation propose_edit
     │       - guards : line-loss >30%, regex hallucination, >5000 lignes,
     │         >20 fichiers
     │       - apply transactionnel + commit + push depuis le code
@@ -125,7 +131,7 @@ Si le script crashe (kill -9, OOM, container restart) le pending JSON reste. Au 
 
 - `scan.py` détecte le `drive_id` déjà présent dans le frontmatter raw → retourne `skipped/already-transcribed`. Le pipeline reconstruit le path et continue.
 - `git commit` no-op si rien à committer.
-- `llm-wiki ingest` rejoue son agent loop ; le LLM voit le log existant et propose des éditions minimales (idempotence sémantique, pas binaire — accepte la dépense LLM en cas de retry).
+- `llm-wiki ingest` rejoue son plan/agent loop ; le LLM voit le log existant et propose des éditions minimales (idempotence sémantique, pas binaire — accepte la dépense LLM en cas de retry).
 - `generate_debrief` skip si `raw/debriefs/<basename>.json` existe et valide.
 - `debrief.py` skip via `find_existing_debrief()` (matché sur `transcript_sha256`).
 
@@ -146,7 +152,8 @@ Le `pipeline_status_message_id` est mémorisé dans le pending JSON dès le prem
 ## Pitfalls
 
 - **Pas de `pip install`** : tout passe par `uv run --with …`.
-- **Pas de `import anthropic` / `openai`** : le debrief passe par `hermes -z` par défaut (provider configuré/OAuth), fallback OpenRouter possible ; l'ingest bufferisé utilise encore OpenRouter.
+- **Pas de `import anthropic` / `openai`** : ingest et debrief passent par `hermes -z` par défaut (provider configuré/OAuth) ; fallback OpenRouter via `PIPELINE_LLM_BACKEND=openrouter` + `OPENROUTER_API_KEY`.
+- **Pourquoi l'ingest hermes n'a pas de tools** : `hermes -z` tourne en YOLO mode avec le toolset config complet — lui donner des tools = relâcher l'agent-orchestrateur qu'on a banni. Le contexte est embarqué dans le prompt (limité par MAX_ARG_STRLEN 128KB argv → budgets de bytes dans ingest_plan.py) et la sortie est un plan JSON borné, validé et appliqué par le code.
 - **Le système prompt d'ingest llm-wiki est lu à runtime** depuis `LLM_WIKI_SKILL_PATH` (`/opt/hermes/skills/research/llm-wiki/SKILL.md` upstream). Si le fichier est absent (mount manquant), un fallback minimal embarqué dans `pipeline.py` prend le relais — l'ingest sera moins riche mais pas cassé.
 - **Le LLM d'ingest n'a PAS access à `write_file`, `git`, `bash`** : l'override injecté en system prompt le précise, mais c'est aussi mécaniquement vrai (les seuls tools déclarés sont `read_file`, `list_dir`, `propose_edit`, `done`). `propose_edit` BUFFERE — aucune écriture filesystem possible côté LLM.
 - **Guards anti-vandalisme** : line-loss >30% sur un fichier existant, regex hallucination (`File unchanged since last read`, `<system-reminder>`, etc.), nouveau fichier >5000 lignes, total >20 fichiers touchés. Si **un seul** guard échoue, **tous** les edits du buffer sont revertés via `git checkout` (working tree restauré, transcript déjà committé reste committé).

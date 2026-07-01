@@ -31,7 +31,9 @@ For each pending entry in $WIKI_PATH/.craig-pending/*.json:
   2. Run craig-transcript-record/scan.py (subprocess), stream its
      progress[] events to the Discord status edit.
   3. git add + commit + push the new transcript.
-  4. llm-wiki ingest: agent loop with read_file/list_dir/propose_edit/
+  4. llm-wiki ingest. Backend hermes (default): two-phase JSON edit
+     plan via `hermes -z` (discovery -> plan, see ingest_plan.py).
+     Backend openrouter: agent loop with read_file/list_dir/propose_edit/
      done tools. Edits are buffered, never applied directly by the LLM.
      Apply transactionally. Run guards (line-loss >30%, hallucination
      regex, file >5000 lines, >20 files touched). On guard fail: revert
@@ -46,12 +48,12 @@ When .craig-pending/ becomes empty after the loop:
   - Self-remove the craig-watch-followup cron via `hermes cron remove`.
 
 Required env: WIKI_PATH, CRAIG_DISCORD_BOT_TOKEN, CRAIG_EVENTS_CHANNEL_ID,
-DISCORD_HOME_CHANNEL, OPENROUTER_API_KEY.
+DISCORD_HOME_CHANNEL. OPENROUTER_API_KEY only when PIPELINE_LLM_BACKEND=openrouter.
 Optional env:
   HERMES_SKILLS_DIR (default /opt/data/skills-shared)
   HERMES_CLI_PATH (default /opt/hermes/.venv/bin/hermes)
   LLM_WIKI_SKILL_PATH (default /opt/hermes/skills/research/llm-wiki/SKILL.md)
-  PIPELINE_LLM_BACKEND (hermes|openrouter; default hermes; debrief only)
+  PIPELINE_LLM_BACKEND (hermes|openrouter; default hermes; ingest + debrief)
   PIPELINE_LLM_TIMEOUT_S (default 300)
   OPENROUTER_MODEL (default google/gemini-3-flash-preview)
   MEETING_DEBRIEF_MIN_DURATION_S (default 180; 10 in test)
@@ -77,6 +79,12 @@ from datetime import datetime, timezone
 import requests
 import yaml
 from jsonschema import Draft202012Validator
+from ingest_plan import (
+    build_discovery_messages,
+    build_plan_messages,
+    parse_edit_plan,
+    parse_reads,
+)
 from llm_backend import (
     LlmBackendConfig,
     complete_text as llm_complete_text,
@@ -92,7 +100,6 @@ REQUIRED_ENV = (
     "CRAIG_DISCORD_BOT_TOKEN",
     "CRAIG_EVENTS_CHANNEL_ID",
     "DISCORD_HOME_CHANNEL",
-    "OPENROUTER_API_KEY",
 )
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
 if _missing:
@@ -110,7 +117,7 @@ DEBRIEFS_DIR = WIKI_PATH / "raw" / "debriefs"
 CRAIG_DISCORD_BOT_TOKEN = os.environ["CRAIG_DISCORD_BOT_TOKEN"]
 CRAIG_EVENTS_CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
 DISCORD_HOME_CHANNEL = os.environ["DISCORD_HOME_CHANNEL"]
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 SKILLS_ROOT = pathlib.Path(os.environ.get("HERMES_SKILLS_DIR", "/opt/data/skills-shared"))
 SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
@@ -136,6 +143,12 @@ _backend_err = validate_backend(PIPELINE_LLM_BACKEND)
 if _backend_err:
     print(json.dumps({"status": "error", "reason": "invalid-llm-backend",
                       "detail": _backend_err}, ensure_ascii=False))
+    sys.exit(2)
+
+if PIPELINE_LLM_BACKEND == "openrouter" and not OPENROUTER_API_KEY:
+    print(json.dumps({"status": "error", "reason": "missing-env",
+                      "detail": "OPENROUTER_API_KEY is required when PIPELINE_LLM_BACKEND=openrouter",
+                      "missing": ["OPENROUTER_API_KEY"]}, ensure_ascii=False))
     sys.exit(2)
 
 LLM_CONFIG = LlmBackendConfig(
@@ -917,13 +930,82 @@ def _agent_loop(transcript_path: pathlib.Path) -> tuple[list[dict], str, str | N
     return buffer, "turn-limit", rationale
 
 
+def _hermes_ingest_plan(transcript_path: pathlib.Path) -> tuple[list[dict], str, str | None]:
+    """Two-phase JSON edit-plan ingest via the Hermes oneshot backend
+    (see ingest_plan.py for why not a tool loop). Same contract as
+    _agent_loop: (buffer, terminal_reason, rationale), with
+    terminal_reason ∈ {'done', 'llm-error'}."""
+    transcript_rel = transcript_path.relative_to(WIKI_PATH).as_posix()
+    body = transcript_path.read_text(encoding="utf-8", errors="replace")
+    tree = sorted(_wiki_baseline(WIKI_PATH).keys())
+
+    # Phase 1 — discovery. Best-effort: on any failure fall back to the
+    # vault's anchor pages rather than aborting the ingest.
+    reads: list[str] = []
+    resp, err = llm_complete_text(
+        LLM_CONFIG,
+        build_discovery_messages(tree, transcript_rel, body),
+        purpose="sélectionner les fichiers wiki à lire avant ingest",
+    )
+    if not err:
+        parsed, _parse_err = parse_reads(resp or "", set(tree))
+        if parsed:
+            reads = parsed
+    if not reads:
+        reads = [p for p in ("log.md", "index.md") if p in tree]
+
+    files: dict[str, str] = {}
+    for path in reads:
+        result = _handle_ingest_tool("read_file", {"path": path}, [])
+        if "content" in result:
+            files[path] = result["content"]
+
+    # Phase 2 — edit plan, 2 attempts with error feedback.
+    messages = build_plan_messages(_read_llm_wiki_skill(), transcript_rel, body, files)
+    last_err: str | None = None
+    for _attempt in range(2):
+        resp, err = llm_complete_text(
+            LLM_CONFIG, messages,
+            purpose="produire le plan d'édition JSON pour l'ingest wiki",
+        )
+        if err:
+            last_err = err
+            continue
+        edits, rationale, plan_err = parse_edit_plan(resp or "")
+        if plan_err:
+            last_err = plan_err
+            messages.append({"role": "assistant", "content": resp or ""})
+            messages.append({"role": "user", "content": (
+                f"Ton plan était invalide ({plan_err}). Réponds UNIQUEMENT "
+                f"avec l'objet JSON demandé, sans fence ni texte autour."
+            )})
+            continue
+        # Same validation surface as the tool loop — rejected edits are
+        # dropped (no feedback round), surfaced in the rationale.
+        buffer: list[dict] = []
+        rejected: list[str] = []
+        for edit in edits:
+            result = _handle_ingest_tool("propose_edit", edit, buffer)
+            if result.get("status") != "buffered":
+                rejected.append(f"{edit.get('path')}: {result.get('reason')}")
+        if rejected:
+            note = f"[{len(rejected)} edit(s) rejeté(s): " + "; ".join(rejected[:5]) + "]"
+            rationale = f"{rationale} {note}".strip() if rationale else note
+        return buffer, "done", rationale
+    return [], "llm-error", last_err
+
+
 def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
-    """Run the agent loop, apply edits transactionally, enforce guards,
-    commit + push on success. Returns a summary dict with keys: status
+    """Run the backend's ingest (Hermes edit plan or OpenRouter agent
+    loop), apply edits transactionally, enforce guards, commit + push on
+    success. Returns a summary dict with keys: status
     ('committed'|'no-op'|'aborted'|'llm-error'), reason?, sha?, n_files,
     n_created, n_updated, debug_path?, terminal_reason."""
     baseline = _wiki_baseline(WIKI_PATH)
-    buffer, terminal, rationale = _agent_loop(transcript_path)
+    if LLM_CONFIG.backend == "hermes":
+        buffer, terminal, rationale = _hermes_ingest_plan(transcript_path)
+    else:
+        buffer, terminal, rationale = _agent_loop(transcript_path)
 
     summary: dict = {
         "terminal_reason": terminal,
@@ -1560,7 +1642,22 @@ def process_pending(pending_path: pathlib.Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--craig-id", help="Process only this craig_id (debug).")
+    ap.add_argument("--ingest-only", metavar="TRANSCRIPT_REL", help=(
+        "Run only the llm-wiki ingest for a wiki-relative transcript path "
+        "(e.g. raw/transcripts/2026-06-15-1906-craig.md), print the summary "
+        "JSON, and exit. No Discord status, no pending/cron handling."
+    ))
     args = ap.parse_args()
+
+    if args.ingest_only:
+        transcript = WIKI_PATH / args.ingest_only
+        if not transcript.is_file():
+            print(json.dumps({"status": "error", "reason": "transcript-not-found",
+                              "path": args.ingest_only}, ensure_ascii=False))
+            return 2
+        ingest = llm_wiki_ingest(transcript)
+        print(json.dumps({"status": "ok", "ingest": ingest}, ensure_ascii=False))
+        return 0
 
     pendings = list_pending()
     if args.craig_id:
