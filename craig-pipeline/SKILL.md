@@ -1,7 +1,7 @@
 ---
 name: craig-pipeline
 description: "Orchestrateur déterministe Python qui pilote toute la chaîne post-Craig (refetch panel Discord -> scan.py -> push transcript -> ingest llm-wiki bufferisé -> génération debrief -> debrief.py post + thread). Ingest et debrief passent par un backend LLM configurable (Hermes/subscription par défaut, OpenRouter en fallback). Tout le reste est code → push garanti, idempotence triviale, monitoring Discord granulaire à chaque phase. Invoqué uniquement par le cron craig-watch-followup."
-version: 1.2.0
+version: 1.3.0
 platforms: [linux]
 metadata:
   hermes:
@@ -50,7 +50,7 @@ required_environment_variables:
     prompt: "Timeout de chaque appel LLM pipeline (ingest + debrief, défaut 300)."
     required_for: optional
   - name: LLM_WIKI_SKILL_PATH
-    prompt: "Chemin du SKILL.md llm-wiki upstream (défaut /opt/hermes/skills/research/llm-wiki/SKILL.md). Lu et injecté en system prompt de l'agent loop d'ingest. Si absent, le pipeline utilise un fallback brief minimal."
+    prompt: "Chemin du SKILL.md llm-wiki upstream (défaut /opt/hermes/skills/research/llm-wiki/SKILL.md). Lu à runtime : system prompt de l'agent loop (backend openrouter), ou embarqué tronqué à 8KB dans le user prompt du plan (backend hermes). Si absent, le pipeline utilise un fallback brief minimal."
     required_for: optional
   - name: PIPELINE_INGEST_MAX_TURNS
     prompt: "Nombre max de turns LLM dans l'agent loop d'ingest (défaut 30, anti-runaway)."
@@ -106,13 +106,18 @@ Décision : passer à un orchestrateur Python déterministe. Les appels LLM (ing
     │       - backend hermes (défaut) : plan d'édition JSON en 2 phases
     │         via `hermes -z` — discovery (tree + extrait transcript →
     │         fichiers à lire) puis plan (contexte embarqué → edits JSON
-    │         bornés), cf. ingest_plan.py
+    │         bornés), cf. ingest_plan.py ; `replace` refusé sur un
+    │         fichier fourni tronqué au LLM
     │       - backend openrouter : agent loop à tools
     │         read_file / list_dir / propose_edit / done
     │       - les deux passent par la même validation propose_edit
+    │       - dry-run en mémoire : les edits individuellement invalides
+    │         (patch chevauchant, cible absente) sont écartés — reportés
+    │         dans dropped_edits + dump debug + message Discord, pas
+    │         fatals ; « tout écarté » est signalé ⚠️, pas comme un no-op
     │       - guards : line-loss >30%, regex hallucination, >5000 lignes,
     │         >20 fichiers
-    │       - apply transactionnel + commit + push depuis le code
+    │       - apply transactionnel (des survivants) + commit + push
     │       - guard fail → revert via git checkout, dump debug, continue
     ├─ 5. génération debrief JSON via backend LLM configurable (Hermes par défaut)
     │       - validate vs meeting-debrief/schema.json
@@ -154,9 +159,10 @@ Le `pipeline_status_message_id` est mémorisé dans le pending JSON dès le prem
 - **Pas de `pip install`** : tout passe par `uv run --with …`.
 - **Pas de `import anthropic` / `openai`** : ingest et debrief passent par `hermes -z` par défaut (provider configuré/OAuth) ; fallback OpenRouter via `PIPELINE_LLM_BACKEND=openrouter` + `OPENROUTER_API_KEY`.
 - **Pourquoi l'ingest hermes n'a pas de tools** : `hermes -z` tourne en YOLO mode avec le toolset config complet — lui donner des tools = relâcher l'agent-orchestrateur qu'on a banni. Le contexte est embarqué dans le prompt (limité par MAX_ARG_STRLEN 128KB argv → budgets de bytes dans ingest_plan.py) et la sortie est un plan JSON borné, validé et appliqué par le code.
-- **Le système prompt d'ingest llm-wiki est lu à runtime** depuis `LLM_WIKI_SKILL_PATH` (`/opt/hermes/skills/research/llm-wiki/SKILL.md` upstream). Si le fichier est absent (mount manquant), un fallback minimal embarqué dans `pipeline.py` prend le relais — l'ingest sera moins riche mais pas cassé.
+- **Le brief llm-wiki est lu à runtime** depuis `LLM_WIKI_SKILL_PATH` (`/opt/hermes/skills/research/llm-wiki/SKILL.md` upstream) : system prompt de l'agent loop en backend openrouter, embarqué (tronqué à 8KB) dans le user prompt du plan en backend hermes. Si le fichier est absent (mount manquant), un fallback minimal embarqué dans `pipeline.py` prend le relais — l'ingest sera moins riche mais pas cassé.
 - **Le LLM d'ingest n'a PAS access à `write_file`, `git`, `bash`** : l'override injecté en system prompt le précise, mais c'est aussi mécaniquement vrai (les seuls tools déclarés sont `read_file`, `list_dir`, `propose_edit`, `done`). `propose_edit` BUFFERE — aucune écriture filesystem possible côté LLM.
-- **Guards anti-vandalisme** : line-loss >30% sur un fichier existant, regex hallucination (`File unchanged since last read`, `<system-reminder>`, etc.), nouveau fichier >5000 lignes, total >20 fichiers touchés. Si **un seul** guard échoue, **tous** les edits du buffer sont revertés via `git checkout` (working tree restauré, transcript déjà committé reste committé).
+- **Dry-run avant apply** : les edits individuellement invalides (patch dont le `find` chevauche un edit précédent, cible manquante, `replace` sur fichier tronqué) sont écartés AVANT l'apply — reportés dans `dropped_edits`, dumpés dans `.craig-pipeline-debug/` et mentionnés dans le message Discord. Un plan entièrement écarté est signalé ⚠️ (pas confondu avec « aucune édition proposée »).
+- **Guards anti-vandalisme** : line-loss >30% sur un fichier existant, regex hallucination (`File unchanged since last read`, `<system-reminder>`, etc.), nouveau fichier >5000 lignes, total >20 fichiers touchés. Si **un seul** guard échoue, **tous** les edits appliqués (les survivants du dry-run) sont revertés via `git checkout` (working tree restauré, transcript déjà committé reste committé).
 - **Discord rate-limits** : ~1 PATCH par phase boundary par recording, on est très loin des limites.
 
 ## Verification
@@ -169,13 +175,14 @@ Après un tick réussi sur 1 recording :
 4. Recap meeting-debrief posté dans `#hermes-perso` avec thread.
 5. Si dernier pending : ✅ final dans `#hermes-perso` + cron removed.
 
-En cas d'ingest aborté par guard : `$WIKI_PATH/.craig-pipeline-debug/<timestamp>.json` contient le buffer d'edits + raison du guard fail. Working tree wiki est intact (commit transcript OK, pas de commit ingest).
+En cas d'ingest aborté par guard : `$WIKI_PATH/.craig-pipeline-debug/<timestamp>.json` contient le buffer d'edits + raison du guard fail. Working tree wiki est intact (commit transcript OK, pas de commit ingest). Les edits écartés au dry-run produisent aussi un dump (`dry-run-dropped: …`) même quand le reste de l'ingest committe.
 
 ## Anti-patterns LLM (côté tick orchestrateur, PAS côté pipeline.py)
 
 - ❌ Ne **pas** invoquer ce script en mode @mention user : il fait des effets de bord (POST Discord, push git, suppression cron). Si l'user pose une question status, lis directement `ls $WIKI_PATH/.craig-pending/`.
 - ❌ Ne **pas** « optimiser » en activant `craig-watch` ou `llm-wiki` ou `meeting-debrief` en parallèle : doublon d'effets de bord, race conditions garanties.
 - ❌ Ne **pas** parser le JSON de sortie pour « réessayer si erreur » côté LLM : le script gère ses retries en interne. Si une étape garde le pending, le tick suivant la reprendra naturellement.
+- ❌ Ne **pas** invoquer `--ingest-only <path>` depuis un tick cron ou une session LLM : flag opérateur (replay manuel d'un ingest raté, humain au clavier). Il court-circuite le flow pending/Discord et dépense du LLM ; un path inventé échoue fast (`transcript-not-found`, exit 2), et l'exit code reflète l'ingest interne (0 committed/no-op, 1 aborted/llm-error).
 
 ## Notes
 

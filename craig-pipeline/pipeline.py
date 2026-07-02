@@ -35,9 +35,12 @@ For each pending entry in $WIKI_PATH/.craig-pending/*.json:
      plan via `hermes -z` (discovery -> plan, see ingest_plan.py).
      Backend openrouter: agent loop with read_file/list_dir/propose_edit/
      done tools. Edits are buffered, never applied directly by the LLM.
-     Apply transactionally. Run guards (line-loss >30%, hallucination
-     regex, file >5000 lines, >20 files touched). On guard fail: revert
-     working tree, dump debug, continue (transcript stays committed).
+     Dry-run drops individually-invalid edits (overlapping patch,
+     missing target) — dropped edits are dumped to debug + surfaced in
+     the Discord message. Then apply the survivors transactionally.
+     Run guards (line-loss >30%, hallucination regex, file >5000 lines,
+     >20 files touched). On guard fail: revert working tree, dump
+     debug, continue (transcript stays committed).
   5. Generate debrief JSON via the configured LLM backend,
      validate against schema.json, write to raw/debriefs/<basename>.json.
   6. Subprocess meeting-debrief/debrief.py to post the recap + thread.
@@ -80,11 +83,14 @@ import requests
 import yaml
 from jsonschema import Draft202012Validator
 from ingest_plan import (
+    RETRY_ECHO_BYTES,
+    apply_edit,
     build_discovery_messages,
     build_plan_messages,
     dry_run_edits,
     parse_edit_plan,
     parse_reads,
+    truncate_utf8,
 )
 from llm_backend import (
     LlmBackendConfig,
@@ -813,8 +819,15 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
             return {"status": "rejected", "reason": err}
         if not abs_path:
             return {"status": "rejected", "reason": "bad path"}
+        # Existence must account for the buffer: a plan that creates a
+        # file then appends/patches it is legitimate, but the create is
+        # only buffered — a disk-only check silently threw away every
+        # follow-up edit on a freshly-created page. The dry-run then
+        # validates the full sequence in-memory.
+        exists = abs_path.exists() or any(
+            e["action"] == "create" and e["path"] == path for e in buffer)
         if action == "create":
-            if abs_path.exists():
+            if exists:
                 return {"status": "rejected", "reason": "file already exists; use append/patch"}
             content = args.get("content", "")
             if not content.strip():
@@ -822,7 +835,7 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
             buffer.append({"action": "create", "path": path, "content": content})
             return {"status": "buffered"}
         if action == "append":
-            if not abs_path.exists():
+            if not exists:
                 return {"status": "rejected", "reason": "file does not exist; use create"}
             content = args.get("content", "")
             if not content.strip():
@@ -830,7 +843,7 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
             buffer.append({"action": "append", "path": path, "content": content})
             return {"status": "buffered"}
         if action == "replace":
-            if not abs_path.exists():
+            if not exists:
                 return {"status": "rejected", "reason": "file does not exist; use create"}
             content = args.get("content", "")
             if not content.strip():
@@ -838,7 +851,7 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
             buffer.append({"action": "replace", "path": path, "content": content})
             return {"status": "buffered"}
         if action == "patch":
-            if not abs_path.exists():
+            if not exists:
                 return {"status": "rejected", "reason": "file does not exist"}
             find = args.get("find", "")
             replace_with = args.get("replace_with", "")
@@ -931,14 +944,16 @@ def _agent_loop(transcript_path: pathlib.Path) -> tuple[list[dict], str, str | N
     return buffer, "turn-limit", rationale
 
 
-def _hermes_ingest_plan(transcript_path: pathlib.Path) -> tuple[list[dict], str, str | None]:
+def _hermes_ingest_plan(transcript_path: pathlib.Path,
+                        tree: list[str]) -> tuple[list[dict], str, str | None]:
     """Two-phase JSON edit-plan ingest via the Hermes oneshot backend
     (see ingest_plan.py for why not a tool loop). Same contract as
     _agent_loop: (buffer, terminal_reason, rationale), with
-    terminal_reason ∈ {'done', 'llm-error'}."""
+    terminal_reason ∈ {'done', 'llm-error'}. `tree` is the sorted list
+    of wiki-relative .md paths, computed once by the caller from its
+    baseline snapshot."""
     transcript_rel = transcript_path.relative_to(WIKI_PATH).as_posix()
     body = transcript_path.read_text(encoding="utf-8", errors="replace")
-    tree = sorted(_wiki_baseline(WIKI_PATH).keys())
 
     # Phase 1 — discovery. Best-effort: on any failure fall back to the
     # vault's anchor pages rather than aborting the ingest.
@@ -955,14 +970,24 @@ def _hermes_ingest_plan(transcript_path: pathlib.Path) -> tuple[list[dict], str,
     if not reads:
         reads = [p for p in ("log.md", "index.md") if p in tree]
 
+    # Read the selected files IN FULL — build_plan_messages owns the
+    # single truncation point, so its truncated-flag is authoritative.
+    # Routing through _handle_ingest_tool("read_file") would add a
+    # second invisible 6KB cap whose truncation the plan prompt could
+    # never warn about.
     files: dict[str, str] = {}
     for path in reads:
-        result = _handle_ingest_tool("read_file", {"path": path}, [])
-        if "content" in result:
-            files[path] = result["content"]
+        abs_path, res_err = _resolve_wiki_path(path, for_write=False)
+        if res_err or not abs_path or not abs_path.is_file():
+            continue
+        try:
+            files[path] = abs_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
 
     # Phase 2 — edit plan, 2 attempts with error feedback.
-    messages = build_plan_messages(_read_llm_wiki_skill(), transcript_rel, body, files)
+    messages, truncated_files = build_plan_messages(
+        _read_llm_wiki_skill(), transcript_rel, body, files)
     last_err: str | None = None
     for _attempt in range(2):
         resp, err = llm_complete_text(
@@ -972,10 +997,15 @@ def _hermes_ingest_plan(transcript_path: pathlib.Path) -> tuple[list[dict], str,
         if err:
             last_err = err
             continue
-        edits, rationale, plan_err = parse_edit_plan(resp or "")
+        edits, rationale, parse_dropped, plan_err = parse_edit_plan(resp or "")
         if plan_err:
             last_err = plan_err
-            messages.append({"role": "assistant", "content": resp or ""})
+            # Bounded echo: the first prompt is ~110KB argv by design,
+            # replaying a big malformed response verbatim can push the
+            # retry past MAX_ARG_STRLEN → E2BIG, burning the attempt
+            # that mattered most.
+            echo, _trunc = truncate_utf8(resp or "", RETRY_ECHO_BYTES)
+            messages.append({"role": "assistant", "content": echo})
             messages.append({"role": "user", "content": (
                 f"Ton plan était invalide ({plan_err}). Réponds UNIQUEMENT "
                 f"avec l'objet JSON demandé, sans fence ni texte autour."
@@ -984,8 +1014,15 @@ def _hermes_ingest_plan(transcript_path: pathlib.Path) -> tuple[list[dict], str,
         # Same validation surface as the tool loop — rejected edits are
         # dropped (no feedback round), surfaced in the rationale.
         buffer: list[dict] = []
-        rejected: list[str] = []
+        rejected: list[str] = list(parse_dropped)
         for edit in edits:
+            if edit["action"] == "replace" and edit["path"] in truncated_files:
+                # The LLM only saw an excerpt of this file: a full-file
+                # replace would silently discard everything past the
+                # truncation point, and a big-enough replace slips past
+                # the 30% line-loss guard.
+                rejected.append(f"{edit['path']}: replace refusé (fichier fourni tronqué)")
+                continue
             result = _handle_ingest_tool("propose_edit", edit, buffer)
             if result.get("status") != "buffered":
                 rejected.append(f"{edit.get('path')}: {result.get('reason')}")
@@ -1004,7 +1041,8 @@ def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
     n_created, n_updated, debug_path?, terminal_reason."""
     baseline = _wiki_baseline(WIKI_PATH)
     if LLM_CONFIG.backend == "hermes":
-        buffer, terminal, rationale = _hermes_ingest_plan(transcript_path)
+        buffer, terminal, rationale = _hermes_ingest_plan(
+            transcript_path, sorted(baseline.keys()))
     else:
         buffer, terminal, rationale = _agent_loop(transcript_path)
 
@@ -1027,12 +1065,23 @@ def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
             return None
         return abs_path.read_text(encoding="utf-8", errors="replace")
 
+    proposed = buffer
     buffer, dropped = dry_run_edits(buffer, _read_current)
     if dropped:
+        # A dropped edit is content the LLM meant to write that never
+        # will be — keep the full proposal on disk for post-mortems
+        # (process_pending relays the count + debug path to Discord).
         summary["dropped_edits"] = dropped
+        summary["debug_path"] = _dump_debug(
+            proposed, baseline, "dry-run-dropped: " + "; ".join(dropped[:10]))
 
     if not buffer:
         summary["status"] = "no-op"
+        if dropped:
+            # Not a real no-op: every proposed edit was dropped — the
+            # fully-hallucinated-plan failure mode (2026-04-26) must not
+            # read as "le LLM n'a rien proposé".
+            summary["reason"] = "all-edits-dropped"
         summary["n_files"] = 0
         summary["n_created"] = 0
         summary["n_updated"] = 0
@@ -1040,7 +1089,6 @@ def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
 
     # Touched-files tally (path -> existed_before? for revert step).
     touched: dict[str, bool] = {}
-    n_created = 0
     applied: list[dict] = []
 
     try:
@@ -1049,50 +1097,20 @@ def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
             abs_path, err = _is_safe_wiki_path(path)
             if err or not abs_path:
                 raise RuntimeError(f"path validation regressed for {path}: {err}")
-            existed_before = abs_path.exists()
+            existed_before = abs_path.is_file()
             if path not in touched:
                 touched[path] = existed_before
-            if edit["action"] == "create":
-                if abs_path.exists():
-                    raise RuntimeError(f"create raced: {path} exists")
-                abs_path.parent.mkdir(parents=True, exist_ok=True)
-                content = edit["content"]
-                if not content.endswith("\n"):
-                    content += "\n"
-                abs_path.write_text(content, encoding="utf-8")
-                n_created += 1 if not existed_before else 0
-                applied.append(edit)
-            elif edit["action"] == "append":
-                size = abs_path.stat().st_size
-                needs_sep = False
-                if size > 0:
-                    with abs_path.open("rb") as fh:
-                        fh.seek(-1, 2)
-                        needs_sep = fh.read(1) != b"\n"
-                content = edit["content"]
-                if not content.endswith("\n"):
-                    content += "\n"
-                with abs_path.open("a", encoding="utf-8") as fh:
-                    fh.write(("\n" if needs_sep else "") + content)
-                applied.append(edit)
-            elif edit["action"] == "replace":
-                content = edit["content"]
-                if not content.endswith("\n"):
-                    content += "\n"
-                abs_path.write_text(content, encoding="utf-8")
-                applied.append(edit)
-            elif edit["action"] == "patch":
-                cur = abs_path.read_text(encoding="utf-8", errors="replace")
-                if edit["find"] not in cur:
-                    raise RuntimeError(f"patch find not in {path}")
-                # Replace only first occurrence — multiple identical
-                # substrings in a wiki page are usually intentional
-                # (links repeated across sections). Forcing the LLM to
-                # disambiguate by enlarging `find` is safer than
-                # silently rewriting all occurrences.
-                new = cur.replace(edit["find"], edit["replace_with"], 1)
-                abs_path.write_text(new, encoding="utf-8")
-                applied.append(edit)
+            # Same apply_edit as the dry-run above — by construction the
+            # sequence can't diverge from what the dry-run accepted
+            # (short of a filesystem race between the two).
+            cur = (abs_path.read_text(encoding="utf-8", errors="replace")
+                   if existed_before else None)
+            new, reject = apply_edit(cur, edit)
+            if reject is not None or new is None:
+                raise RuntimeError(f"{path}: {reject}")
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_text(new, encoding="utf-8")
+            applied.append(edit)
     except Exception as exc:
         _revert_touched(touched)
         debug_path = _dump_debug(buffer, baseline, f"apply-failed: {exc}")
@@ -1287,17 +1305,22 @@ def generate_debrief(transcript_path: pathlib.Path, schema: dict) -> tuple[dict 
             last_err = err
             time.sleep(2 * (attempt + 1))
             continue
+        # Retry echoes are bounded for the same reason as the ingest
+        # plan: en backend hermes le prompt entier repasse en argv à
+        # chaque attempt, et 3 échos complets cumulés peuvent dépasser
+        # MAX_ARG_STRLEN.
+        echo, _trunc = truncate_utf8(content or "", RETRY_ECHO_BYTES)
         text, extract_err = extract_json_object(content or "")
         if extract_err or not text:
             last_err = extract_err or "no-json-object"
-            messages.append({"role": "assistant", "content": content or ""})
+            messages.append({"role": "assistant", "content": echo})
             messages.append({"role": "user", "content": f"Ta réponse ne contenait pas d'objet JSON valide ({last_err}). Réessaie, JSON pur, pas de fence."})
             continue
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             last_err = f"bad-json: {exc}"
-            messages.append({"role": "assistant", "content": content or ""})
+            messages.append({"role": "assistant", "content": echo})
             messages.append({"role": "user", "content": f"Ta réponse n'était pas du JSON valide ({exc}). Réessaie, JSON pur, pas de fence."})
             continue
         # Force transcript_path even if model hallucinated a different value.
@@ -1306,7 +1329,7 @@ def generate_debrief(transcript_path: pathlib.Path, schema: dict) -> tuple[dict 
         if not errors:
             return data, None
         last_err = "; ".join(f"{'/'.join(map(str, e.path)) or '<root>'}: {e.message}" for e in errors[:5])
-        messages.append({"role": "assistant", "content": content or ""})
+        messages.append({"role": "assistant", "content": echo})
         messages.append({"role": "user", "content": f"Ta réponse ne valide pas le schéma : {last_err}. Corrige et renvoie un JSON conforme."})
     return None, last_err or "unknown"
 
@@ -1572,16 +1595,26 @@ def process_pending(pending_path: pathlib.Path) -> dict:
     post_phase("done", push_text)
 
     # Phase 4 — llm-wiki ingest.
-    post_phase("inprogress", "Ingest llm-wiki (agent loop bufferisé)…")
+    post_phase("inprogress", f"Ingest llm-wiki ({PIPELINE_LLM_BACKEND}, éditions bufferisées)…")
     ingest = llm_wiki_ingest(transcript_abs)
     summary["ingest"] = ingest
+    n_dropped = len(ingest.get("dropped_edits") or [])
     if ingest["status"] == "committed":
+        dropped_note = (f" ⚠️ {n_dropped} édition(s) écartée(s) au dry-run "
+                        f"(debug: `{ingest.get('debug_path','?')}`)." if n_dropped else "")
         post_phase("done",
                    f"Wiki ingéré : {ingest['n_files']} fichier(s) "
                    f"({ingest['n_created']} créé(s), {ingest['n_updated']} maj), "
-                   f"commit `{ingest.get('sha','?')}`.")
+                   f"commit `{ingest.get('sha','?')}`.{dropped_note}")
     elif ingest["status"] == "no-op":
-        post_phase("done", "Wiki ingest : aucune édition proposée par le LLM.")
+        if n_dropped:
+            # All-dropped ≠ no-op : le plan existait mais rien n'a survécu
+            # au dry-run (mode d'échec « plan halluciné » du 2026-04-26).
+            post_phase("error",
+                       f"Wiki ingest : {n_dropped} édition(s) proposée(s), TOUTES "
+                       f"écartées au dry-run (debug: `{ingest.get('debug_path','?')}`).")
+        else:
+            post_phase("done", "Wiki ingest : aucune édition proposée par le LLM.")
     elif ingest["status"] in ("aborted", "llm-error"):
         post_phase("error",
                    f"Ingest aborté ({ingest.get('reason','?')[:200]}). "
@@ -1671,8 +1704,13 @@ def main() -> int:
                               "path": args.ingest_only}, ensure_ascii=False))
             return 2
         ingest = llm_wiki_ingest(transcript)
-        print(json.dumps({"status": "ok", "ingest": ingest}, ensure_ascii=False))
-        return 0
+        # Top-level status + exit code must mirror the inner ingest —
+        # an operator replay chained with && (or checking $?) doit voir
+        # l'échec, pas un "ok" enveloppant un "aborted".
+        ok = ingest.get("status") in ("committed", "no-op")
+        print(json.dumps({"status": "ok" if ok else "error", "ingest": ingest},
+                         ensure_ascii=False))
+        return 0 if ok else 1
 
     pendings = list_pending()
     if args.craig_id:

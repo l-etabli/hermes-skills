@@ -65,46 +65,66 @@ class ParseEditPlanTest(unittest.TestCase):
             "rationale": "log + index + nouvelle page",
         }
 
-        edits, rationale, err = ingest_plan.parse_edit_plan(
+        edits, rationale, dropped, err = ingest_plan.parse_edit_plan(
             "```json\n" + json.dumps(plan) + "\n```"
         )
 
         self.assertIsNone(err)
         self.assertEqual(len(edits), 3)
+        self.assertEqual(dropped, [])
         self.assertEqual(rationale, "log + index + nouvelle page")
 
     def test_empty_edits_is_valid(self):
-        edits, rationale, err = ingest_plan.parse_edit_plan(
+        edits, rationale, dropped, err = ingest_plan.parse_edit_plan(
             '{"edits": [], "rationale": "smalltalk, rien à ingérer"}'
         )
 
         self.assertIsNone(err)
         self.assertEqual(edits, [])
+        self.assertEqual(dropped, [])
 
-    def test_rejects_bad_action_missing_content_and_missing_find(self):
-        _, _, err = ingest_plan.parse_edit_plan(
+    def test_soft_bad_edits_are_dropped_not_fatal(self):
+        # One whitespace-only append among good edits must not burn a
+        # whole plan attempt — drop it, keep the rest.
+        plan = {"edits": [
+            {"action": "append", "path": "log.md", "content": "- entry"},
+            {"action": "append", "path": "log.md", "content": "  "},
+            {"action": "delete", "path": "log.md"},
+            {"action": "patch", "path": "log.md", "replace_with": "x"},
+            {"action": "create", "path": "concepts/x.md", "content": "# X"},
+        ]}
+
+        edits, _, dropped, err = ingest_plan.parse_edit_plan(json.dumps(plan))
+
+        self.assertIsNone(err)
+        self.assertEqual([e["path"] for e in edits], ["log.md", "concepts/x.md"])
+        self.assertEqual(len(dropped), 3)
+        self.assertIn("missing-content", dropped[0])
+        self.assertIn("bad-action", dropped[1])
+        self.assertIn("patch-missing-find", dropped[2])
+
+    def test_all_edits_invalid_is_an_error(self):
+        # A non-empty plan where nothing survives must still trigger
+        # the caller's feedback retry.
+        _, _, dropped, err = ingest_plan.parse_edit_plan(
             '{"edits": [{"action": "delete", "path": "log.md"}]}'
         )
-        self.assertIn("bad-action", err)
 
-        _, _, err = ingest_plan.parse_edit_plan(
-            '{"edits": [{"action": "append", "path": "log.md", "content": "  "}]}'
-        )
-        self.assertIn("missing-content", err)
+        self.assertIn("all-edits-invalid", err)
+        self.assertEqual(len(dropped), 1)
 
-        _, _, err = ingest_plan.parse_edit_plan(
-            '{"edits": [{"action": "patch", "path": "log.md", "replace_with": "x"}]}'
-        )
-        self.assertIn("patch-missing-find", err)
-
-    def test_rejects_too_many_edits(self):
-        edits = [{"action": "append", "path": "log.md", "content": "x"}] * (
-            ingest_plan.MAX_EDITS + 1
+    def test_truncates_at_max_edits(self):
+        edits_in = [{"action": "append", "path": "log.md", "content": "x"}] * (
+            ingest_plan.MAX_EDITS + 3
         )
 
-        _, _, err = ingest_plan.parse_edit_plan(json.dumps({"edits": edits}))
+        edits, _, dropped, err = ingest_plan.parse_edit_plan(
+            json.dumps({"edits": edits_in}))
 
-        self.assertIn("too-many-edits", err)
+        self.assertIsNone(err)
+        self.assertEqual(len(edits), ingest_plan.MAX_EDITS)
+        self.assertEqual(len(dropped), 3)
+        self.assertIn("over-max-edits", dropped[0])
 
 
 class DryRunEditsTest(unittest.TestCase):
@@ -173,21 +193,56 @@ class BuildPlanMessagesTest(unittest.TestCase):
     def test_prompt_stays_under_argv_budget(self):
         files = {f"p{i}.md": "x" * 50_000 for i in range(ingest_plan.MAX_READS + 5)}
 
-        messages = ingest_plan.build_plan_messages(
+        messages, truncated = ingest_plan.build_plan_messages(
             "b" * 50_000, "raw/transcripts/t.md", "t" * 200_000, files,
         )
 
         total = sum(len(m["content"].encode("utf-8")) for m in messages)
         self.assertLess(total, 120_000)
         self.assertIn("raw/transcripts/t.md", messages[0]["content"])
+        self.assertEqual(len(truncated), ingest_plan.MAX_READS)
 
-    def test_truncated_file_carries_no_patch_warning(self):
-        messages = ingest_plan.build_plan_messages(
+    def test_truncated_file_flagged_and_carries_warnings(self):
+        messages, truncated = ingest_plan.build_plan_messages(
             "brief", "raw/transcripts/t.md", "body",
-            {"log.md": "x" * (ingest_plan.PLAN_FILE_BYTES + 1)},
+            {"log.md": "x" * (ingest_plan.PLAN_FILE_BYTES + 1), "index.md": "short"},
         )
 
+        self.assertEqual(truncated, {"log.md"})
         self.assertIn("ne PAS le patcher", messages[0]["content"])
+        self.assertIn("`replace` est interdit", messages[0]["content"])
+
+
+class ApplyEditTest(unittest.TestCase):
+    def test_create_normalizes_trailing_newline_and_rejects_existing(self):
+        new, reject = ingest_plan.apply_edit(
+            None, {"action": "create", "path": "x.md", "content": "# X"})
+        self.assertEqual(new, "# X\n")
+        self.assertIsNone(reject)
+
+        _, reject = ingest_plan.apply_edit(
+            "already\n", {"action": "create", "path": "x.md", "content": "# X"})
+        self.assertIn("file exists", reject)
+
+    def test_append_inserts_separator_only_when_needed(self):
+        new, _ = ingest_plan.apply_edit(
+            "a", {"action": "append", "path": "x.md", "content": "b"})
+        self.assertEqual(new, "a\nb\n")
+
+        new, _ = ingest_plan.apply_edit(
+            "a\n", {"action": "append", "path": "x.md", "content": "b"})
+        self.assertEqual(new, "a\nb\n")
+
+    def test_patch_replaces_first_occurrence_only(self):
+        new, _ = ingest_plan.apply_edit(
+            "x y x\n", {"action": "patch", "path": "p.md",
+                        "find": "x", "replace_with": "z"})
+        self.assertEqual(new, "z y x\n")
+
+        _, reject = ingest_plan.apply_edit(
+            "abc\n", {"action": "patch", "path": "p.md",
+                      "find": "nope", "replace_with": "z"})
+        self.assertIn("find absent", reject)
 
 
 if __name__ == "__main__":
