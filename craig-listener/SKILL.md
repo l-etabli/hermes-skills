@@ -19,16 +19,13 @@ required_environment_variables:
   - name: CRAIG_EVENTS_CHANNEL_ID
     prompt: "ID du canal Discord #craig-events de cette instance. Utilisé par la self-discovery pour trouver le message Craig correspondant à un Recording ID donné."
     required_for: full functionality
-  - name: GITHUB_TOKEN
-    prompt: "Token GitHub pour le push (refresh via la GitHub App). Hérité par craig-transcript-record."
-    required_for: full functionality
   - name: GOOGLE_APPLICATION_CREDENTIALS
     prompt: "Chemin du JSON Service Account Drive. Hérité par craig-transcript-record."
     required_for: full functionality
   - name: AUDIO_DRIVE_FOLDER_ID
     prompt: "ID du dossier Drive d'auto-upload Craig. Hérité par craig-transcript-record."
     required_for: full functionality
-  - name: GROQ_API_KEY
+  - name: CRAIG_GROQ_API_KEY
     prompt: "Clé API Groq. Hérité par craig-transcript-record."
     required_for: full functionality
 ---

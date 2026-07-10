@@ -13,9 +13,6 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Chemin absolu vers le vault llm-wiki (ex. /opt/data/wiki). Le skill llm-wiki utilise la même variable."
     required_for: full functionality
-  - name: GITHUB_TOKEN
-    prompt: "Token GitHub avec droit d'écriture sur le repo KB (refresh auto via la GitHub App de l'instance). Utilisé pour le push final."
-    required_for: full functionality
   - name: GOOGLE_APPLICATION_CREDENTIALS
     prompt: "Chemin absolu vers le JSON du Service Account Google (ex. /opt/data/google-drive-sa.json). Le SA doit avoir le dossier Drive partagé avec lui (rôle Viewer minimum)."
     required_for: full functionality
