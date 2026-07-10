@@ -5,10 +5,10 @@
 # ///
 """
 weekly-digest: récap vendredi 17h ou briefing lundi 9h, posté dans
-$DISCORD_HOME_CHANNEL + appendé au log.md du KB.
+$CRAIG_HOME_CHANNEL + appendé au log.md du KB.
 
 Mode passé par le cron (--recap | --briefing). UN SEUL appel LLM
-(génération du digest via OpenRouter). Tout le reste est code.
+(génération via `hermes -z`, provider GPT/OAuth configuré). Tout le reste est code.
 
 Usage:
     uv run --with requests --with pyyaml digest.py --recap
@@ -31,9 +31,8 @@ import requests
 
 REQUIRED_ENV = (
     "WIKI_PATH",
-    "DISCORD_BOT_TOKEN",
-    "DISCORD_HOME_CHANNEL",
-    "OPENROUTER_API_KEY",
+    "CRAIG_DISCORD_BOT_TOKEN",
+    "CRAIG_HOME_CHANNEL",
 )
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
 if _missing:
@@ -42,11 +41,11 @@ if _missing:
 
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 LOG_FILE = WIKI_PATH / "log.md"
-DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
-DISCORD_HOME_CHANNEL = os.environ["DISCORD_HOME_CHANNEL"]
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+DISCORD_BOT_TOKEN = os.environ["CRAIG_DISCORD_BOT_TOKEN"]
+DISCORD_HOME_CHANNEL = os.environ["CRAIG_HOME_CHANNEL"]
 
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
+HERMES_CLI = pathlib.Path(os.environ.get("HERMES_CLI_PATH", "/opt/hermes/.venv/bin/hermes"))
+HERMES_LLM_TIMEOUT_S = int(os.environ.get("HERMES_LLM_TIMEOUT_S", "180"))
 GITHUB_ENV_FILE = pathlib.Path(os.environ.get("HERMES_ENV_FILE", "/opt/data/.env"))
 GIT_AUTHOR_NAME = os.environ.get("HERMES_GIT_AUTHOR_NAME", "Hermes weekly-digest")
 GIT_AUTHOR_EMAIL = os.environ.get("HERMES_GIT_AUTHOR_EMAIL", "hermes-weekly-digest@l-etabli.local")
@@ -55,7 +54,6 @@ INSTANCE_NAME = os.environ.get("HERMES_INSTANCE", pathlib.Path(WIKI_PATH).name)
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_USER_AGENT = "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01 UTC, used in snowflake -> timestamp
-OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def fail(reason: str, **extra) -> None:
@@ -149,7 +147,7 @@ def fetch_channel_messages(channel_id: str, since: datetime, hard_cap: int = 200
     return out
 
 
-# ----------------------------- openrouter -----------------------------
+# ----------------------------- llm via Hermes subscription -----------------------------
 
 LENGTH_CONSTRAINT = (
     " Contrainte stricte : la réponse sera postée telle quelle sur Discord, "
@@ -176,37 +174,37 @@ PROMPTS = {
 }
 
 
-def call_openrouter(mode: str, days: int, transcript: str) -> tuple[str | None, str | None]:
+def call_hermes(
+    mode: str,
+    days: int,
+    transcript: str,
+    run_command=subprocess.run,
+) -> tuple[str | None, str | None]:
     system = PROMPTS[mode].format(days=days).replace("<instance>", INSTANCE_NAME)
-    body = {
-        "model": OPENROUTER_MODEL,
-        "max_tokens": 700,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": transcript[:60000]},
-        ],
-    }
+    prompt = (
+        f"{system}\n\n"
+        "## Messages Discord à synthétiser\n"
+        f"{transcript[:60000]}\n\n"
+        "Réponds uniquement avec le digest final, sans préambule."
+    )
     try:
-        r = requests.post(
-            OPENROUTER_API,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/l-etabli/hermes-skills",
-                "X-Title": "weekly-digest",
-            },
-            json=body,
-            timeout=120,
+        result = run_command(
+            [str(HERMES_CLI), "-z", prompt],
+            cwd=str(WIKI_PATH),
+            capture_output=True,
+            text=True,
+            timeout=HERMES_LLM_TIMEOUT_S,
         )
-    except requests.RequestException as exc:
-        return None, f"network: {type(exc).__name__}: {exc}"
-    if not r.ok:
-        return None, f"openrouter-{r.status_code}: {r.text[:300]}"
-    try:
-        choices = r.json().get("choices") or []
-        return (choices[0]["message"]["content"] or "").strip(), None
-    except (ValueError, KeyError, IndexError):
-        return None, f"openrouter-bad-shape: {r.text[:200]}"
+    except subprocess.TimeoutExpired:
+        return None, f"hermes-timeout: {HERMES_LLM_TIMEOUT_S}s"
+    except OSError as exc:
+        return None, f"hermes-exec: {exc}"
+    output = (result.stdout or "").strip()
+    if result.returncode != 0:
+        return None, f"hermes-{result.returncode}: {(result.stderr or output)[:300]}"
+    if not output:
+        return None, "hermes-empty-output"
+    return output, None
 
 
 # ----------------------------- git -----------------------------
@@ -242,9 +240,17 @@ def push_url_with_token(token: str) -> str | None:
 
 
 def append_log_and_push(mode: str, digest: str) -> tuple[str | None, str | None]:
-    pull = git("pull", "--rebase", "origin", "HEAD", check=False)
+    token = read_github_token()
+    if not token:
+        return None, "push-no-token"
+    authenticated_url = push_url_with_token(token)
+    if not authenticated_url:
+        return None, "push-bad-remote"
+
+    pull = git("pull", "--rebase", authenticated_url, "HEAD", check=False)
     if pull.returncode != 0:
-        return None, f"git-pull: {(pull.stderr or pull.stdout)[:200]}"
+        detail = (pull.stderr or pull.stdout).replace(token, "***")[:200]
+        return None, f"git-pull: {detail}"
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     entry = f"\n## {today} — weekly-{mode}\n\n{digest.strip()}\n"
@@ -258,14 +264,8 @@ def append_log_and_push(mode: str, digest: str) -> tuple[str | None, str | None]
         return None, None  # nothing staged
     git("commit", "-m", f"log: weekly-{mode} {today}")
 
-    token = read_github_token()
-    if not token:
-        return None, "push-no-token"
-    push_url = push_url_with_token(token)
-    if not push_url:
-        return None, "push-bad-remote"
     push = subprocess.run(
-        ["git", "-C", str(WIKI_PATH), "push", push_url, "HEAD"],
+        ["git", "-C", str(WIKI_PATH), "push", authenticated_url, "HEAD"],
         capture_output=True, text=True,
     )
     if push.returncode != 0:
@@ -306,9 +306,9 @@ def main() -> None:
     else:
         transcript = "\n".join(transcript_parts)
 
-    digest, err = call_openrouter(mode, args.days, transcript)
+    digest, err = call_hermes(mode, args.days, transcript)
     if err:
-        fail("openrouter", detail=err)
+        fail("hermes", detail=err)
 
     if args.dry_run:
         print(json.dumps({

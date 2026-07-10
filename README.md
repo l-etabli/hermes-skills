@@ -128,7 +128,7 @@ Famille **Wiki texte** — capture conversationnelle Discord -> KB :
 | Skill | Catégorie | Trigger | Rôle |
 |---|---|---|---|
 | [`wiki-quick`](./wiki-quick/) | research | Mention user (« wiki ça », « ingest cette conv ») | Drop conversationnel : pose le contenu dans `raw/notes/<slug>.md` du KB avec frontmatter (`source: discord`, `captured_by: wiki-quick`, `channel`, `participants`), pull/commit/push. Aucun appel LLM. L'agent enchaîne avec `llm-wiki ingest <path>` pour la promotion en pages `entities/`/`concepts/` selon les seuils du SCHEMA. |
-| [`weekly-digest`](./weekly-digest/) | kb | Cron 2× / semaine | `--recap` vendredi 17h (3 bullets décidé/livré/noté), `--briefing` lundi 9h (objectifs/actions reprises/blocages/échéances). Lit l'historique 7j des channels visibles au bot via Discord REST, 1 appel OpenRouter, POST dans `$DISCORD_HOME_CHANNEL`, append au `log.md` du KB. Posté dans le **même canal** pour continuité visuelle (le briefing lundi affiche le récap vendredi juste au-dessus). |
+| [`weekly-digest`](./weekly-digest/) | kb | Cron 2× / semaine | `--recap` vendredi 17h (3 bullets décidé/livré/noté), `--briefing` lundi 9h (objectifs/actions reprises/blocages/échéances). Lit l'historique 7j des channels visibles au bot dédié, génère via `hermes -z` avec le provider GPT/OAuth, POST dans `$CRAIG_HOME_CHANNEL`, append au `log.md` du KB. |
 
 ### Exemples rapides
 

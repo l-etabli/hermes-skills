@@ -1,6 +1,6 @@
 ---
 name: weekly-digest
-description: "Digest hebdomadaire des messages Discord visibles à l'instance, posté dans `$DISCORD_HOME_CHANNEL` + appendé au `log.md` du KB. Mode passé en argument du cron : `--recap` (vendredi 17h, 3 bullets décidé/livré/noté) ou `--briefing` (lundi 9h, objectifs/actions/blocages/échéances). UN SEUL appel LLM (génération du digest via OpenRouter). Invoqué uniquement par cron."
+description: "Digest hebdomadaire des messages Discord visibles à l'instance, posté dans `$CRAIG_HOME_CHANNEL` + appendé au `log.md` du KB. Mode passé en argument du cron : `--recap` (vendredi 17h, 3 bullets décidé/livré/noté) ou `--briefing` (lundi 9h, objectifs/actions/blocages/échéances). UN SEUL appel LLM via `hermes -z` et le provider GPT/OAuth configuré. Invoqué uniquement par cron."
 version: 1.0.0
 platforms: [linux]
 metadata:
@@ -13,14 +13,11 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Chemin absolu vers le vault llm-wiki. Le digest est appendé à log.md."
     required_for: full functionality
-  - name: DISCORD_BOT_TOKEN
+  - name: CRAIG_DISCORD_BOT_TOKEN
     prompt: "Token bot Discord pour lire l'historique 7j et POST dans le home channel."
     required_for: full functionality
-  - name: DISCORD_HOME_CHANNEL
+  - name: CRAIG_HOME_CHANNEL
     prompt: "ID du canal où poster le digest (récap vendredi + briefing lundi : même canal pour continuité visuelle)."
-    required_for: full functionality
-  - name: OPENROUTER_API_KEY
-    prompt: "Clé API OpenRouter pour générer le digest (Gemini 3 Flash par défaut)."
     required_for: full functionality
   - name: GITHUB_TOKEN
     prompt: "Installation token GitHub App pour push log.md (refresh sidecar 45m)."
@@ -72,7 +69,7 @@ uv run --with requests --with pyyaml \
     /opt/data/skills-shared/weekly-digest/digest.py --recap
 ```
 
-Et reporte la sortie JSON. **Pas d'orchestration LLM** : le script gère tout (Discord fetch, OpenRouter, post, log append, commit/push).
+Et reporte la sortie JSON. **Pas d'orchestration LLM** : le script gère tout (Discord fetch, `hermes -z`, post, log append, commit/push).
 
 ## Architecture
 
@@ -87,7 +84,7 @@ Cron tick (vendredi 17h ou lundi 9h)
   │        donc le filtrage par catégorie/rôle est déjà fait par Discord)
   ├─ 3. Pour chaque channel : GET messages avant 7j (via snowflake `after`)
   │       agrège (channel, author, timestamp, content)
-  ├─ 4. 1 appel OpenRouter (gemini-3-flash-preview) avec prompt mode-spécifique
+  ├─ 4. 1 appel `hermes -z` avec le provider GPT/OAuth configuré
   ├─ 5. POST le digest dans DISCORD_HOME_CHANNEL
   ├─ 6. Append au $WIKI_PATH/log.md (entrée datée + mode + digest brut)
   └─ 7. git add log.md + commit + push
@@ -105,7 +102,7 @@ Aucune. Si le cron ratisse 2 fois (manuel + horaire), tu auras 2 posts. Acceptab
 ## Pitfalls
 
 - **Pas de `pip install`** : `uv run --with requests --with pyyaml`.
-- **Pas d'`import openai` / `anthropic`** : `requests.post(OPENROUTER_API)` direct.
+- **Pas d'appel API LLM direct** : `hermes -z` réutilise le provider GPT/OAuth configuré sur l'instance.
 - **Discord rate-limits** : le scan parcourt potentiellement N channels × M messages. Implémenté avec backoff exponentiel + respect du `Retry-After`. Sur ~10 channels et ~7j de trafic, ça reste sous 50 calls.
 - **Token Discord scopes** : nécessite `View Channel` + `Read Message History` sur tous les channels à digérer (déjà acquis si le bot voit le canal).
 - **`DISCORD_HOME_CHANNEL`** : doit être un text channel où le bot peut POST. Pas de check préalable, l'erreur Discord remonte tel quel dans le JSON.

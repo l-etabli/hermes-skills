@@ -15,7 +15,7 @@ LLM session that fires the cron does ONE thing: subprocess this script
 and report its JSON output. All orchestration (Discord status edits,
 git ops, llm-wiki ingest, debrief generation, debrief.py invocation,
 self-cron-removal) is handled here in code. LLM calls are isolated
-behind explicit backends (Hermes subscription by default; OpenRouter fallback).
+through Hermes one-shot mode and the configured GPT/OAuth subscription.
 
 Why deterministic: in production the LLM-as-orchestrator was observed
 committing without pushing, silently skipping ingest, vandalizing
@@ -31,10 +31,9 @@ For each pending entry in $WIKI_PATH/.craig-pending/*.json:
   2. Run craig-transcript-record/scan.py (subprocess), stream its
      progress[] events to the Discord status edit.
   3. git add + commit + push the new transcript.
-  4. llm-wiki ingest. Backend hermes (default): two-phase JSON edit
+  4. llm-wiki ingest: two-phase JSON edit
      plan via `hermes -z` (discovery -> plan, see ingest_plan.py).
-     Backend openrouter: agent loop with read_file/list_dir/propose_edit/
-     done tools. Edits are buffered, never applied directly by the LLM.
+     Edits are buffered, never applied directly by the LLM.
      Dry-run drops individually-invalid edits (overlapping patch,
      missing target) — dropped edits are dumped to debug + surfaced in
      the Discord message. Then apply the survivors transactionally.
@@ -51,17 +50,13 @@ When .craig-pending/ becomes empty after the loop:
   - Self-remove the craig-watch-followup cron via `hermes cron remove`.
 
 Required env: WIKI_PATH, CRAIG_DISCORD_BOT_TOKEN, CRAIG_EVENTS_CHANNEL_ID,
-CRAIG_HOME_CHANNEL. OPENROUTER_API_KEY only when PIPELINE_LLM_BACKEND=openrouter.
+CRAIG_HOME_CHANNEL.
 Optional env:
   HERMES_SKILLS_DIR (default /opt/data/skills-shared)
   HERMES_CLI_PATH (default /opt/hermes/.venv/bin/hermes)
   LLM_WIKI_SKILL_PATH (default /opt/hermes/skills/research/llm-wiki/SKILL.md)
-  PIPELINE_LLM_BACKEND (hermes|openrouter; default hermes; ingest + debrief)
   PIPELINE_LLM_TIMEOUT_S (default 300)
-  OPENROUTER_MODEL (default google/gemini-3-flash-preview)
   MEETING_DEBRIEF_MIN_DURATION_S (default 180; 10 in test)
-  PIPELINE_INGEST_MAX_TURNS (default 30)
-  PIPELINE_INGEST_MAX_TOOL_CALLS (default 50)
 
 Output: single JSON object on stdout summarizing the run.
 """
@@ -96,8 +91,6 @@ from llm_backend import (
     LlmBackendConfig,
     complete_text as llm_complete_text,
     extract_json_object,
-    openrouter_chat,
-    validate_backend,
 )
 
 # ----------------------------- env / paths -----------------------------
@@ -124,7 +117,6 @@ DEBRIEFS_DIR = WIKI_PATH / "raw" / "debriefs"
 CRAIG_DISCORD_BOT_TOKEN = os.environ["CRAIG_DISCORD_BOT_TOKEN"]
 CRAIG_EVENTS_CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
 DISCORD_HOME_CHANNEL = os.environ["CRAIG_HOME_CHANNEL"]
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 SKILLS_ROOT = pathlib.Path(os.environ.get("HERMES_SKILLS_DIR", "/opt/data/skills-shared"))
 SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
@@ -135,37 +127,15 @@ LLM_WIKI_SKILL_PATH = pathlib.Path(
     os.environ.get("LLM_WIKI_SKILL_PATH", "/opt/hermes/skills/research/llm-wiki/SKILL.md")
 )
 
-PIPELINE_LLM_BACKEND = os.environ.get("PIPELINE_LLM_BACKEND", "hermes").strip().lower()
 PIPELINE_LLM_TIMEOUT_S = int(os.environ.get("PIPELINE_LLM_TIMEOUT_S", "300"))
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
 MIN_DURATION_S = int(os.environ.get("MEETING_DEBRIEF_MIN_DURATION_S", "180"))
-INGEST_MAX_TURNS = int(os.environ.get("PIPELINE_INGEST_MAX_TURNS", "30"))
-INGEST_MAX_TOOL_CALLS = int(os.environ.get("PIPELINE_INGEST_MAX_TOOL_CALLS", "50"))
 
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_USER_AGENT = "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)"
-OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
-
-_backend_err = validate_backend(PIPELINE_LLM_BACKEND)
-if _backend_err:
-    print(json.dumps({"status": "error", "reason": "invalid-llm-backend",
-                      "detail": _backend_err}, ensure_ascii=False))
-    sys.exit(2)
-
-if PIPELINE_LLM_BACKEND == "openrouter" and not OPENROUTER_API_KEY:
-    print(json.dumps({"status": "error", "reason": "missing-env",
-                      "detail": "OPENROUTER_API_KEY is required when PIPELINE_LLM_BACKEND=openrouter",
-                      "missing": ["OPENROUTER_API_KEY"]}, ensure_ascii=False))
-    sys.exit(2)
-
 LLM_CONFIG = LlmBackendConfig(
-    backend=PIPELINE_LLM_BACKEND,
     hermes_cli=HERMES_CLI,
     cwd=WIKI_PATH,
     timeout_s=PIPELINE_LLM_TIMEOUT_S,
-    openrouter_api_key=OPENROUTER_API_KEY,
-    openrouter_api=OPENROUTER_API,
-    openrouter_model=OPENROUTER_MODEL,
 )
 
 FOLLOWUP_CRON_NAME = "craig-watch-followup"
@@ -568,110 +538,6 @@ def github_link(repo: pathlib.Path, sha: str) -> str:
 
 # ----------------------------- llm-wiki ingest -----------------------------
 
-INGEST_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a file from the wiki vault. Path is wiki-relative.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Wiki-relative path (e.g. 'index.md', 'people/jerome.md')."}
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_dir",
-            "description": "List entries in a wiki directory. Path is wiki-relative.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Wiki-relative directory path. Use '.' for the wiki root."}
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "propose_edit",
-            "description": (
-                "Buffer an edit to the wiki. Does NOT touch the filesystem — "
-                "the orchestrator validates and applies all buffered edits "
-                "atomically when you call `done`. Returns 'buffered' or "
-                "'rejected: <reason>'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "append", "replace", "patch"],
-                        "description": (
-                            "create: new file. append: append text to existing file. "
-                            "replace: overwrite full content (rare, use for refactors). "
-                            "patch: find/replace a single substring."
-                        ),
-                    },
-                    "path": {"type": "string", "description": "Wiki-relative path. Cannot be inside raw/ or .craig-*/."},
-                    "content": {
-                        "type": "string",
-                        "description": "Required for create/append/replace. Full content (create/replace) or text to append (append).",
-                    },
-                    "find": {"type": "string", "description": "Required for patch. Exact substring to find."},
-                    "replace_with": {"type": "string", "description": "Required for patch. Replacement text."},
-                },
-                "required": ["action", "path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "done",
-            "description": "Signal end of ingest session. Pass a short rationale describing what was changed.",
-            "parameters": {
-                "type": "object",
-                "properties": {"rationale": {"type": "string"}},
-                "required": ["rationale"],
-            },
-        },
-    },
-]
-
-
-INGEST_OVERRIDE = """\
-
----
-
-# Override (orchestrator-injected, mandatory)
-
-Tu n'as PAS access à `write_file`, `git`, `bash` ou shell d'aucune sorte.
-Pour proposer des éditions au vault, utilise EXCLUSIVEMENT l'outil
-`propose_edit` qui buffere ta demande sans toucher au filesystem.
-L'orchestrator validera (guards anti-vandalisme) et appliquera les
-éditions de manière transactionnelle quand tu appelleras `done`.
-
-Outils disponibles : `read_file`, `list_dir`, `propose_edit`, `done`.
-
-Règles strictes :
-- N'écris JAMAIS dans `raw/` (transcripts + debriefs gérés par le code).
-- N'écris JAMAIS de chatter de tool-call, de `<system-reminder>`, ou
-  de paraphrase d'un read_file dans le contenu d'un fichier wiki.
-- Préfère `append`/`patch` à `replace` (replace écrase tout le fichier).
-- Si tu ne sais pas quoi faire, appelle `done` avec un rationale court.
-  Un ingest vide vaut mieux qu'un ingest halluciné.
-- Limite ferme : 30 turns max, 50 tool calls max. Au-delà l'orchestrator
-  coupe court et récupère ton buffer en l'état.
-"""
-
-
 def _resolve_wiki_path(p: str, *, for_write: bool) -> tuple[pathlib.Path | None, str | None]:
     """Resolve a user-supplied wiki-relative path.
 
@@ -867,83 +733,6 @@ def _handle_ingest_tool(name: str, args: dict, buffer: list[dict]) -> dict:
     return {"error": f"unknown tool: {name}"}
 
 
-def _agent_loop(transcript_path: pathlib.Path) -> tuple[list[dict], str, str | None]:
-    """Drive the OpenRouter agent loop. Returns (buffer, terminal_reason,
-    rationale). terminal_reason ∈ {'done', 'turn-limit', 'tool-call-limit',
-    'no-tool-calls', 'llm-error'}."""
-    skill_md = _read_llm_wiki_skill()
-    system = skill_md + INGEST_OVERRIDE
-    transcript_rel = transcript_path.relative_to(WIKI_PATH).as_posix()
-    user_prompt = (
-        f"Voici un nouveau transcript à ingérer dans le wiki : `{transcript_rel}`.\n\n"
-        f"1. Lis-le avec `read_file`.\n"
-        f"2. Explore le vault (people/, concepts/, log.md, index.md...) avec "
-        f"`list_dir` et `read_file` pour repérer les pages existantes "
-        f"correspondant aux entités/concepts/personnes mentionnés.\n"
-        f"3. Propose les éditions nécessaires via `propose_edit` : entrée "
-        f"de log, mise à jour de pages personnes/concepts, nouvelles pages "
-        f"concept si pertinent, mise à jour des index/dataview.\n"
-        f"4. Termine avec `done` quand tu as fini, ou immédiatement avec "
-        f"`done` si le transcript ne mérite pas d'ingest (smalltalk, test "
-        f"technique, recording vide).\n"
-    )
-    messages: list[dict] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_prompt},
-    ]
-    buffer: list[dict] = []
-    rationale: str | None = None
-    tool_calls_total = 0
-
-    for turn in range(INGEST_MAX_TURNS):
-        resp, err = openrouter_chat(LLM_CONFIG, messages, tools=INGEST_TOOLS)
-        if err:
-            return buffer, "llm-error", err
-        try:
-            choice = resp["choices"][0]
-            assistant = choice["message"]
-        except (KeyError, IndexError, TypeError):
-            return buffer, "llm-error", f"bad-response: {str(resp)[:300]}"
-
-        # Forward the assistant message verbatim — OpenAI/OpenRouter
-        # require the same tool_calls payload to be replayed back
-        # before the matching `tool` messages.
-        messages.append({
-            "role": "assistant",
-            "content": assistant.get("content") or "",
-            "tool_calls": assistant.get("tool_calls") or [],
-        })
-        tool_calls = assistant.get("tool_calls") or []
-        if not tool_calls:
-            return buffer, "no-tool-calls", rationale
-
-        done_called = False
-        for tc in tool_calls:
-            tool_calls_total += 1
-            fn = tc.get("function") or {}
-            name = fn.get("name", "")
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            result = _handle_ingest_tool(name, args, buffer)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.get("id", ""),
-                "content": json.dumps(result, ensure_ascii=False)[:8000],
-            })
-            if name == "done":
-                done_called = True
-                rationale = args.get("rationale")
-            if tool_calls_total >= INGEST_MAX_TOOL_CALLS:
-                return buffer, "tool-call-limit", rationale
-
-        if done_called:
-            return buffer, "done", rationale
-
-    return buffer, "turn-limit", rationale
-
-
 def _hermes_ingest_plan(transcript_path: pathlib.Path,
                         tree: list[str]) -> tuple[list[dict], str, str | None]:
     """Two-phase JSON edit-plan ingest via the Hermes oneshot backend
@@ -1034,17 +823,13 @@ def _hermes_ingest_plan(transcript_path: pathlib.Path,
 
 
 def llm_wiki_ingest(transcript_path: pathlib.Path) -> dict:
-    """Run the backend's ingest (Hermes edit plan or OpenRouter agent
-    loop), apply edits transactionally, enforce guards, commit + push on
+    """Run the Hermes edit-plan ingest, apply edits transactionally, enforce guards, commit + push on
     success. Returns a summary dict with keys: status
     ('committed'|'no-op'|'aborted'|'llm-error'), reason?, sha?, n_files,
     n_created, n_updated, debug_path?, terminal_reason."""
     baseline = _wiki_baseline(WIKI_PATH)
-    if LLM_CONFIG.backend == "hermes":
-        buffer, terminal, rationale = _hermes_ingest_plan(
-            transcript_path, sorted(baseline.keys()))
-    else:
-        buffer, terminal, rationale = _agent_loop(transcript_path)
+    buffer, terminal, rationale = _hermes_ingest_plan(
+        transcript_path, sorted(baseline.keys()))
 
     summary: dict = {
         "terminal_reason": terminal,
@@ -1595,7 +1380,7 @@ def process_pending(pending_path: pathlib.Path) -> dict:
     post_phase("done", push_text)
 
     # Phase 4 — llm-wiki ingest.
-    post_phase("inprogress", f"Ingest llm-wiki ({PIPELINE_LLM_BACKEND}, éditions bufferisées)…")
+    post_phase("inprogress", "Ingest llm-wiki (GPT/OAuth, éditions bufferisées)…")
     ingest = llm_wiki_ingest(transcript_abs)
     summary["ingest"] = ingest
     n_dropped = len(ingest.get("dropped_edits") or [])
@@ -1628,7 +1413,7 @@ def process_pending(pending_path: pathlib.Path) -> dict:
         summary.update({"phase": "done-short"})
         return summary
 
-    post_phase("inprogress", f"Génération debrief ({PIPELINE_LLM_BACKEND})…")
+    post_phase("inprogress", "Génération debrief (GPT/OAuth)…")
 
     DEBRIEFS_DIR.mkdir(parents=True, exist_ok=True)
     debrief_path = DEBRIEFS_DIR / f"{transcript_abs.stem}.json"

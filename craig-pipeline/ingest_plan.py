@@ -1,16 +1,15 @@
 """Two-phase JSON edit-plan ingest for the Hermes oneshot backend.
 
-The OpenRouter ingest path drives an in-process tool-calling loop
-(read_file/list_dir/propose_edit/done). `hermes -z` can't offer those
-tools without unleashing a full YOLO agent on the container — the exact
-failure mode craig-pipeline was built to eliminate. Instead the Hermes
-path embeds all context in the prompt and asks for bounded JSON:
+`hermes -z` can't offer a restricted tool set without unleashing a full
+YOLO agent on the container — the exact failure mode craig-pipeline was
+built to eliminate. The ingest therefore embeds all context in the prompt
+and asks for bounded JSON:
 
   Phase 1 (discovery): wiki tree + transcript excerpt -> {"reads": [paths]}
   Phase 2 (plan): transcript + selected file contents -> {"edits": [...], "rationale"}
 
-The pipeline then validates each edit through the same propose_edit
-checks, guards, and transactional apply as the tool loop.
+The pipeline then validates each edit through propose_edit checks,
+guards, and a transactional apply.
 
 Everything here is a pure function over strings/dicts — no env, no
 filesystem, no network — so tests don't need the pipeline's prod env.

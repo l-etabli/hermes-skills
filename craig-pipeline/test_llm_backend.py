@@ -40,13 +40,9 @@ class LlmBackendTest(unittest.TestCase):
         llm_backend = load_llm_backend()
         with tempfile.TemporaryDirectory() as tmp:
             config = llm_backend.LlmBackendConfig(
-                backend="hermes",
                 hermes_cli=pathlib.Path("/opt/hermes/.venv/bin/hermes"),
                 cwd=pathlib.Path(tmp),
                 timeout_s=123,
-                openrouter_api_key="",
-                openrouter_api="https://openrouter.invalid/chat",
-                openrouter_model="model",
             )
             calls = []
 
@@ -73,49 +69,6 @@ class LlmBackendTest(unittest.TestCase):
             self.assertIn("Réponds en JSON", calls[0]["cmd"][2])
             self.assertEqual(calls[0]["cwd"], str(pathlib.Path(tmp)))
             self.assertEqual(calls[0]["timeout"], 123)
-
-    def test_openrouter_chat_uses_shared_timeout(self):
-        llm_backend = load_llm_backend()
-        config = llm_backend.LlmBackendConfig(
-            backend="openrouter",
-            hermes_cli=pathlib.Path("/opt/hermes/.venv/bin/hermes"),
-            cwd=pathlib.Path("/tmp"),
-            timeout_s=321,
-            openrouter_api_key="key",
-            openrouter_api="https://openrouter.invalid/chat",
-            openrouter_model="model",
-        )
-        calls = []
-
-        class FakeResponse:
-            ok = True
-            status_code = 200
-            text = '{"choices":[{"message":{"content":"ok"}}]}'
-
-            def json(self):
-                return {"choices": [{"message": {"content": "ok"}}]}
-
-        def fake_post(url, **kwargs):
-            calls.append({"url": url, **kwargs})
-            return FakeResponse()
-
-        response, err = llm_backend.openrouter_chat(
-            config,
-            [{"role": "user", "content": "hello"}],
-            post_request=fake_post,
-        )
-
-        self.assertIsNone(err)
-        self.assertEqual(response["choices"][0]["message"]["content"], "ok")
-        self.assertEqual(calls[0]["timeout"], 321)
-
-    def test_validate_backend_rejects_invalid_backend(self):
-        llm_backend = load_llm_backend()
-
-        err = llm_backend.validate_backend("wat")
-
-        self.assertIn("unsupported-llm-backend", err)
-
 
 if __name__ == "__main__":
     unittest.main()
