@@ -19,13 +19,13 @@ required_environment_variables:
   - name: CRAIG_EVENTS_CHANNEL_ID
     prompt: "ID du canal #craig-events (où le status message live edité est posté en reply au panel Craig)."
     required_for: full functionality
-  - name: DISCORD_HOME_CHANNEL
+  - name: CRAIG_HOME_CHANNEL
     prompt: "ID du canal humain où le recap meeting-debrief est posté (et le ✅ final quand .craig-pending/ se vide)."
     required_for: full functionality
   - name: OPENROUTER_API_KEY
     prompt: "Clé API OpenRouter. Requise UNIQUEMENT si PIPELINE_LLM_BACKEND=openrouter (le backend hermes par défaut n'en a pas besoin — ingest et debrief passent par `hermes -z`)."
     required_for: optional
-  - name: GROQ_API_KEY
+  - name: CRAIG_GROQ_API_KEY
     prompt: "Hérité par scan.py (transcription Groq Whisper)."
     required_for: full functionality
   - name: GOOGLE_APPLICATION_CREDENTIALS

@@ -22,7 +22,7 @@ required_environment_variables:
   - name: AUDIO_DRIVE_FOLDER_ID
     prompt: "ID du dossier Google Drive scanné par le skill. Copie depuis l'URL Drive: drive.google.com/drive/folders/<ID>. Tout zip Craig auto-uploadé là sera transcrit (à condition qu'on connaisse son recording ID)."
     required_for: full functionality
-  - name: GROQ_API_KEY
+  - name: CRAIG_GROQ_API_KEY
     prompt: "Clé API Groq (https://console.groq.com/keys) pour la transcription Whisper Large v3 Turbo."
     required_for: full functionality
 ---
@@ -75,7 +75,7 @@ Avant de lancer, observe ces règles propres à l'environnement Hermes :
 
 ```bash
 command -v uv && command -v ffmpeg && \
-  for v in WIKI_PATH GOOGLE_APPLICATION_CREDENTIALS AUDIO_DRIVE_FOLDER_ID GROQ_API_KEY GITHUB_TOKEN; do \
+  for v in WIKI_PATH GOOGLE_APPLICATION_CREDENTIALS AUDIO_DRIVE_FOLDER_ID CRAIG_GROQ_API_KEY GITHUB_TOKEN; do \
     [ -n "${!v}" ] || { echo "missing $v"; exit 1; }; \
   done && echo "ok"
 ```

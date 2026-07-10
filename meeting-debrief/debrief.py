@@ -22,7 +22,7 @@ Usage:
       /opt/data/skills-shared/meeting-debrief/debrief.py \
       --debrief-path raw/debriefs/2026-04-25-craig-xxx.json
 
-Required env: WIKI_PATH, DISCORD_BOT_TOKEN, DISCORD_HOME_CHANNEL.
+Required env: WIKI_PATH, CRAIG_DISCORD_BOT_TOKEN, CRAIG_HOME_CHANNEL.
 Optional env: MEETING_DEBRIEF_MIN_DURATION_S (default 180).
 
 Output (single JSON object on stdout):
@@ -54,8 +54,12 @@ import requests
 import yaml
 from jsonschema import Draft202012Validator
 
-REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN", "DISCORD_HOME_CHANNEL")
+REQUIRED_ENV = ("WIKI_PATH",)
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
+if not (os.environ.get("CRAIG_DISCORD_BOT_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN")):
+    _missing.append("CRAIG_DISCORD_BOT_TOKEN")
+if not (os.environ.get("CRAIG_HOME_CHANNEL") or os.environ.get("DISCORD_HOME_CHANNEL")):
+    _missing.append("CRAIG_HOME_CHANNEL")
 if _missing:
     print(json.dumps({"status": "error", "reason": "missing-env",
                       "detail": f"missing required env vars: {', '.join(_missing)}",
@@ -63,8 +67,8 @@ if _missing:
     sys.exit(2)
 
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
-DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
-DISCORD_HOME_CHANNEL = os.environ["DISCORD_HOME_CHANNEL"]
+DISCORD_BOT_TOKEN = os.environ.get("CRAIG_DISCORD_BOT_TOKEN") or os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_HOME_CHANNEL = os.environ.get("CRAIG_HOME_CHANNEL") or os.environ["DISCORD_HOME_CHANNEL"]
 MIN_DURATION_S = int(os.environ.get("MEETING_DEBRIEF_MIN_DURATION_S", "180"))
 
 DEBRIEFS_DIR = WIKI_PATH / "raw" / "debriefs"

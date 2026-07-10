@@ -1,6 +1,6 @@
 ---
 name: meeting-debrief
-description: "Après chaque transcript Craig ingéré dans le wiki (post-craig-watch processed), génère un debrief structuré (TLDR + décisions + open questions + action items typés) et le poste dans DISCORD_HOME_CHANNEL avec un thread de validation. Phase 2 : dispatche les actions validées vers github-issues / hermes-cron / google-workspace / obsidian / linear."
+description: "Après chaque transcript Craig ingéré dans le wiki (post-craig-watch processed), génère un debrief structuré (TLDR + décisions + open questions + action items typés) et le poste dans CRAIG_HOME_CHANNEL avec un thread de validation. Phase 2 : dispatche les actions validées vers github-issues / hermes-cron / google-workspace / obsidian / linear."
 version: 0.1.0
 platforms: [linux]
 metadata:
@@ -13,10 +13,10 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Lit raw/transcripts/, écrit raw/debriefs/ et .craig-debriefs-pending/."
     required_for: full functionality
-  - name: DISCORD_BOT_TOKEN
+  - name: CRAIG_DISCORD_BOT_TOKEN
     prompt: "Token bot pour POSTer le recap, créer le thread, éditer le message recap au moment du dispatch."
     required_for: full functionality
-  - name: DISCORD_HOME_CHANNEL
+  - name: CRAIG_HOME_CHANNEL
     prompt: "ID du canal Discord humain où poster le recap (PAS #craig-events, qui est log technique)."
     required_for: full functionality
   - name: MEETING_DEBRIEF_MIN_DURATION_S
@@ -26,7 +26,7 @@ required_environment_variables:
 
 # Meeting Debrief
 
-Transforme un transcript Craig (déjà ingéré dans le wiki par `craig-watch` + `llm-wiki`) en un debrief humain (TLDR + décisions + actions à valider) posté dans `DISCORD_HOME_CHANNEL`. Un thread est ouvert sous le recap : l'utilisateur valide / refuse les actions ; à sa réponse, ce skill dispatche chaque action validée vers le bon skill cible (`github-issues`, `hermes-cron` natif, `google-workspace`, `obsidian`, `linear`).
+Transforme un transcript Craig (déjà ingéré dans le wiki par `craig-watch` + `llm-wiki`) en un debrief humain (TLDR + décisions + actions à valider) posté dans `CRAIG_HOME_CHANNEL`. Un thread est ouvert sous le recap : l'utilisateur valide / refuse les actions ; à sa réponse, ce skill dispatche chaque action validée vers le bon skill cible (`github-issues`, `hermes-cron` natif, `google-workspace`, `obsidian`, `linear`).
 
 ## When to Use
 
@@ -165,7 +165,7 @@ Quand tu reçois un message Discord :
    ' "$WIKI_PATH/raw/debriefs/<file>.json"
    ```
 
-2. Un ou plusieurs messages sont visibles dans `DISCORD_HOME_CHANNEL` avec le recap markdown. Si le debrief dépasse ~1900 chars, il est splitté en plusieurs messages aux frontières de section (`### TLDR` / `### Décisions` / `### Questions ouvertes` / `### Actions proposées`) ; la section `Actions` est toujours dans son propre message pour que dispatch.py puisse l'éditer sur place.
+2. Un ou plusieurs messages sont visibles dans `CRAIG_HOME_CHANNEL` avec le recap markdown. Si le debrief dépasse ~1900 chars, il est splitté en plusieurs messages aux frontières de section (`### TLDR` / `### Décisions` / `### Questions ouvertes` / `### Actions proposées`) ; la section `Actions` est toujours dans son propre message pour que dispatch.py puisse l'éditer sur place.
 3. Un thread est ouvert sous le PREMIER message (`parent_message_id`), contenant le prompt de validation.
 4. `$WIKI_PATH/.craig-debriefs-pending/<thread_id>.json` existe avec `action_items`, `actions_message_id`, `actions_message_content`, `parent_message_id`, `transcript_sha256`.
 5. Relance manuelle de `debrief.py --debrief-path <même path>` → `skipped/already-debriefed`.

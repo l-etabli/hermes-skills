@@ -47,11 +47,11 @@ For each pending entry in $WIKI_PATH/.craig-pending/*.json:
   7. Delete the pending JSON.
 
 When .craig-pending/ becomes empty after the loop:
-  - Post one ✅ in DISCORD_HOME_CHANNEL.
+  - Post one ✅ in CRAIG_HOME_CHANNEL.
   - Self-remove the craig-watch-followup cron via `hermes cron remove`.
 
 Required env: WIKI_PATH, CRAIG_DISCORD_BOT_TOKEN, CRAIG_EVENTS_CHANNEL_ID,
-DISCORD_HOME_CHANNEL. OPENROUTER_API_KEY only when PIPELINE_LLM_BACKEND=openrouter.
+CRAIG_HOME_CHANNEL. OPENROUTER_API_KEY only when PIPELINE_LLM_BACKEND=openrouter.
 Optional env:
   HERMES_SKILLS_DIR (default /opt/data/skills-shared)
   HERMES_CLI_PATH (default /opt/hermes/.venv/bin/hermes)
@@ -106,7 +106,7 @@ REQUIRED_ENV = (
     "WIKI_PATH",
     "CRAIG_DISCORD_BOT_TOKEN",
     "CRAIG_EVENTS_CHANNEL_ID",
-    "DISCORD_HOME_CHANNEL",
+    "CRAIG_HOME_CHANNEL",
 )
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
 if _missing:
@@ -123,7 +123,7 @@ DEBRIEFS_DIR = WIKI_PATH / "raw" / "debriefs"
 
 CRAIG_DISCORD_BOT_TOKEN = os.environ["CRAIG_DISCORD_BOT_TOKEN"]
 CRAIG_EVENTS_CHANNEL_ID = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
-DISCORD_HOME_CHANNEL = os.environ["DISCORD_HOME_CHANNEL"]
+DISCORD_HOME_CHANNEL = os.environ["CRAIG_HOME_CHANNEL"]
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 SKILLS_ROOT = pathlib.Path(os.environ.get("HERMES_SKILLS_DIR", "/opt/data/skills-shared"))

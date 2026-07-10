@@ -30,7 +30,7 @@ Usage:
   Overrides are applied to validated actions before they appear in
   to_invoke[].
 
-Required env: WIKI_PATH, DISCORD_BOT_TOKEN.
+Required env: WIKI_PATH, CRAIG_DISCORD_BOT_TOKEN.
 
 Output (single JSON object on stdout):
   {"status": "dispatched",
@@ -51,8 +51,10 @@ import traceback
 
 import requests
 
-REQUIRED_ENV = ("WIKI_PATH", "DISCORD_BOT_TOKEN")
+REQUIRED_ENV = ("WIKI_PATH",)
 _missing = [v for v in REQUIRED_ENV if not os.environ.get(v)]
+if not (os.environ.get("CRAIG_DISCORD_BOT_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN")):
+    _missing.append("CRAIG_DISCORD_BOT_TOKEN")
 if _missing:
     print(json.dumps({"status": "error", "reason": "missing-env",
                       "detail": f"missing required env vars: {', '.join(_missing)}",
@@ -60,7 +62,7 @@ if _missing:
     sys.exit(2)
 
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
-DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_BOT_TOKEN = os.environ.get("CRAIG_DISCORD_BOT_TOKEN") or os.environ["DISCORD_BOT_TOKEN"]
 PENDING_DIR = WIKI_PATH / ".craig-debriefs-pending"
 DISCORD_API = "https://discord.com/api/v10"
 # Cloudflare in front of discord.com refuses python-requests' default
