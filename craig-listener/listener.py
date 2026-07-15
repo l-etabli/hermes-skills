@@ -315,6 +315,11 @@ def ensure_followup_cron() -> str:
             hermes_cli, "cron", "create",
             "every 5m",
             "--name", FOLLOWUP_CRON_NAME,
+            # pipeline.py posts every user-facing Discord update itself.
+            # Keep the scheduler result local, otherwise Hermes defaults to
+            # deliver=origin and dumps a wrapped "Cronjob Response" into the
+            # parent #craig-events channel on every tick.
+            "--deliver", "local",
             # craig-pipeline is the only skill the tick LLM needs — it
             # drives pipeline.py which composes scan.py + debrief.py
             # internally. craig-watch / llm-wiki / meeting-debrief are
