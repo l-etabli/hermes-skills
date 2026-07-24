@@ -256,6 +256,45 @@ def test_three_identical_retryable_failures_quarantine_once(
     assert [channel for channel, _ in notifications] == ["thread", "456"]
 
 
+def test_completed_checkpoint_does_not_reset_repeated_later_failure(
+    monkeypatch, tmp_path
+):
+    pipeline = _load_pipeline(monkeypatch, tmp_path)
+    pending_path = tmp_path / ".craig-pending" / "recording.json"
+    pending = pipeline.migrate_pending({
+        "craig_id": "recording",
+        "first_seen_at": datetime.now(timezone.utc).isoformat(),
+    })
+    pipeline._complete_stage(
+        pending,
+        "debrief_generation",
+        transcript_sha256="transcript-sha",
+    )
+    pipeline.save_pending(pending_path, pending)
+
+    first = pipeline.record_failure(
+        pending_path,
+        pending,
+        "debrief-post",
+        "discord-create-thread: discord-400 code 160004",
+    )
+    pending = pipeline.load_pending(pending_path)
+    pipeline._complete_stage(
+        pending,
+        "debrief_generation",
+        transcript_sha256="transcript-sha",
+    )
+    second = pipeline.record_failure(
+        pending_path,
+        pending,
+        "debrief-post",
+        "discord-create-thread: discord-400 code 160004",
+    )
+
+    assert first["consecutive"] == 1
+    assert second["consecutive"] == 2
+
+
 def test_type_error_is_quarantined_immediately(monkeypatch, tmp_path):
     pipeline = _load_pipeline(monkeypatch, tmp_path)
     pending_path = tmp_path / ".craig-pending" / "recording.json"

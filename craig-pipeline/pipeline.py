@@ -411,14 +411,17 @@ def _completed(stage: dict | None, transcript_sha256: str | None = None) -> bool
 
 
 def _complete_stage(pending: dict, name: str, **details) -> None:
-    pending.setdefault("stages", {})[name] = {
+    stages = pending.setdefault("stages", {})
+    was_completed = stages.get(name, {}).get("status") == "completed"
+    stages[name] = {
         "status": "completed",
         "completed_at": datetime.now(timezone.utc).isoformat(),
         **details,
     }
-    failures = pending.setdefault("failures", {})
-    failures["consecutive"] = 0
-    failures["last_fingerprint"] = None
+    if not was_completed:
+        failures = pending.setdefault("failures", {})
+        failures["consecutive"] = 0
+        failures["last_fingerprint"] = None
 
 
 def _find_existing_transcript(craig_id: str) -> pathlib.Path | None:

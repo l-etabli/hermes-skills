@@ -188,6 +188,100 @@ def discord_post(path: str, body: dict) -> tuple[dict | None, str | None]:
         return None, f"discord-bad-json: {r.text[:200]}"
 
 
+def discord_get(path: str) -> tuple[dict | list | None, str | None]:
+    try:
+        r = requests.get(
+            f"{DISCORD_API}{path}",
+            headers={
+                "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                "User-Agent": DISCORD_USER_AGENT,
+            },
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        return None, f"network: {exc}"
+    if not r.ok:
+        return None, f"discord-{r.status_code}: {r.text[:300]}"
+    try:
+        return r.json(), None
+    except ValueError:
+        return None, f"discord-bad-json: {r.text[:200]}"
+
+
+def _is_home_thread(thread: object, parent_message_id: str) -> bool:
+    return (
+        isinstance(thread, dict)
+        and str(thread.get("id") or "") == parent_message_id
+        and str(thread.get("parent_id") or "") == DISCORD_HOME_CHANNEL
+        and isinstance(thread.get("thread_metadata"), dict)
+    )
+
+
+def find_existing_recap_thread(recap_chunks: list[str]) -> dict | None:
+    """Recover the newest complete recap attempt and its auto-thread.
+
+    Hermes may create a thread automatically as soon as the recap's first
+    message is posted. If a previous run then failed while explicitly
+    creating that same thread, reusing the exact messages avoids duplicate
+    recaps on every pipeline retry.
+    """
+    messages, err = discord_get(
+        f"/channels/{DISCORD_HOME_CHANNEL}/messages?limit=100"
+    )
+    if err or not isinstance(messages, list):
+        return None
+
+    newest_by_content: dict[str, dict] = {}
+    expected = set(recap_chunks)
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if content in expected and content not in newest_by_content:
+            newest_by_content[content] = message
+    if any(chunk not in newest_by_content for chunk in recap_chunks):
+        return None
+
+    parent_message_id = str(newest_by_content[recap_chunks[0]].get("id") or "")
+    thread, thread_err = discord_get(f"/channels/{parent_message_id}")
+    if thread_err or not _is_home_thread(thread, parent_message_id):
+        return None
+
+    actions_chunk = next(
+        (chunk for chunk in recap_chunks if chunk.lstrip().startswith("### Actions")),
+        recap_chunks[-1],
+    )
+    return {
+        "parent_message_id": parent_message_id,
+        "actions_message_id": str(
+            newest_by_content[actions_chunk].get("id") or ""
+        ),
+        "actions_message_content": actions_chunk,
+        "last_message_id": str(
+            newest_by_content[recap_chunks[-1]].get("id") or ""
+        ),
+        "thread_id": parent_message_id,
+    }
+
+
+def create_or_reuse_thread(
+    parent_message_id: str, name: str
+) -> tuple[dict | None, str | None]:
+    thread, err = discord_post(
+        f"/channels/{DISCORD_HOME_CHANNEL}/messages/{parent_message_id}/threads",
+        {"name": name[:90], "auto_archive_duration": 1440},
+    )
+    if not err:
+        return thread, None
+    if "160004" not in err:
+        return None, err
+
+    existing, existing_err = discord_get(f"/channels/{parent_message_id}")
+    if existing_err or not _is_home_thread(existing, parent_message_id):
+        return None, err
+    return existing, None
+
+
 def split_recap(recap: str, max_chunk: int = DISCORD_CONTENT_MAX) -> list[str]:
     """Split the recap into one or more Discord messages of ≤ max_chunk
     chars. Splits at section boundaries (`### ...`).
@@ -296,47 +390,54 @@ def main() -> int:
     full_recap_md = format_recap(debrief, transcript_rel)
     recap_chunks = split_recap(full_recap_md)
 
-    parent_message_id: str | None = None
-    actions_message_id: str | None = None
-    actions_message_content: str | None = None
-    last_message_id: str | None = None
-    for i, chunk in enumerate(recap_chunks):
-        msg, err = discord_post(
-            f"/channels/{DISCORD_HOME_CHANNEL}/messages",
-            {"content": chunk},
+    recovered = find_existing_recap_thread(recap_chunks)
+    if recovered:
+        parent_message_id = recovered["parent_message_id"]
+        actions_message_id = recovered["actions_message_id"]
+        actions_message_content = recovered["actions_message_content"]
+        last_message_id = recovered["last_message_id"]
+        thread_id = recovered["thread_id"]
+    else:
+        parent_message_id: str | None = None
+        actions_message_id: str | None = None
+        actions_message_content: str | None = None
+        last_message_id: str | None = None
+        for i, chunk in enumerate(recap_chunks):
+            msg, err = discord_post(
+                f"/channels/{DISCORD_HOME_CHANNEL}/messages",
+                {"content": chunk},
+            )
+            if err:
+                emit({"status": "error", "reason": "discord-post-recap",
+                      "detail": err, "chunk_index": i,
+                      "chunks_posted": i,
+                      "parent_message_id": parent_message_id})
+                return 1
+            mid = msg["id"]
+            if i == 0:
+                parent_message_id = mid
+            if chunk.lstrip().startswith("### Actions"):
+                actions_message_id = mid
+                actions_message_content = chunk
+            last_message_id = mid
+
+        # If no chunk started with "### Actions" (e.g. actions were absent or
+        # the section title was rephrased by the formatter), fall back to the
+        # last message — dispatch.py's annotate is a no-op on text without
+        # numbered action lines, so this stays safe.
+        if not actions_message_id:
+            actions_message_id = last_message_id
+            actions_message_content = recap_chunks[-1]
+
+        thread, err = create_or_reuse_thread(
+            parent_message_id,
+            f"Debrief {transcript_rel.split('/')[-1]}",
         )
         if err:
-            emit({"status": "error", "reason": "discord-post-recap",
-                  "detail": err, "chunk_index": i,
-                  "chunks_posted": i,
-                  "parent_message_id": parent_message_id})
+            emit({"status": "error", "reason": "discord-create-thread",
+                  "detail": err, "parent_message_id": parent_message_id})
             return 1
-        mid = msg["id"]
-        if i == 0:
-            parent_message_id = mid
-        if chunk.lstrip().startswith("### Actions"):
-            actions_message_id = mid
-            actions_message_content = chunk
-        last_message_id = mid
-
-    # If no chunk started with "### Actions" (e.g. actions were absent or
-    # the section title was rephrased by the formatter), fall back to the
-    # last message — dispatch.py's annotate is a no-op on text without
-    # numbered action lines, so this stays safe.
-    if not actions_message_id:
-        actions_message_id = last_message_id
-        actions_message_content = recap_chunks[-1]
-
-    thread, err = discord_post(
-        f"/channels/{DISCORD_HOME_CHANNEL}/messages/{parent_message_id}/threads",
-        {"name": f"Debrief {transcript_rel.split('/')[-1]}"[:90],
-         "auto_archive_duration": 1440},
-    )
-    if err:
-        emit({"status": "error", "reason": "discord-create-thread",
-              "detail": err, "parent_message_id": parent_message_id})
-        return 1
-    thread_id = thread["id"]
+        thread_id = thread["id"]
 
     if actions:
         prompt = (
