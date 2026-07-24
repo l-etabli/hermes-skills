@@ -63,6 +63,7 @@ Output: single JSON object on stdout summarizing the run.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -110,7 +111,9 @@ if _missing:
 
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 PENDING_DIR = WIKI_PATH / ".craig-pending"
+FAILED_DIR = WIKI_PATH / ".craig-failed"
 DEBUG_DIR = WIKI_PATH / ".craig-pipeline-debug"
+LOCK_PATH = WIKI_PATH / ".craig-pipeline.lock"
 TRANSCRIPTS_DIR = WIKI_PATH / "raw" / "transcripts"
 DEBRIEFS_DIR = WIKI_PATH / "raw" / "debriefs"
 
@@ -129,6 +132,7 @@ LLM_WIKI_SKILL_PATH = pathlib.Path(
 
 PIPELINE_LLM_TIMEOUT_S = int(os.environ.get("PIPELINE_LLM_TIMEOUT_S", "300"))
 MIN_DURATION_S = int(os.environ.get("MEETING_DEBRIEF_MIN_DURATION_S", "180"))
+MAX_AGE_HOURS = float(os.environ.get("CRAIG_PIPELINE_MAX_AGE_HOURS", "6"))
 
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_USER_AGENT = "DiscordBot (https://github.com/l-etabli/hermes-skills, 1.0)"
@@ -364,7 +368,13 @@ def load_pending(path: pathlib.Path) -> dict:
 
 
 def save_pending(path: pathlib.Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
 
 def delete_pending(path: pathlib.Path) -> None:
@@ -372,6 +382,276 @@ def delete_pending(path: pathlib.Path) -> None:
         path.unlink()
     except OSError:
         pass
+
+
+STAGE_NAMES = (
+    "transcript",
+    "transcript_push",
+    "ingest",
+    "debrief_generation",
+    "debrief_post",
+)
+
+
+def _sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _completed(stage: dict | None, transcript_sha256: str | None = None) -> bool:
+    if not stage or stage.get("status") != "completed":
+        return False
+    return (
+        transcript_sha256 is None
+        or stage.get("transcript_sha256") == transcript_sha256
+    )
+
+
+def _complete_stage(pending: dict, name: str, **details) -> None:
+    pending.setdefault("stages", {})[name] = {
+        "status": "completed",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        **details,
+    }
+    failures = pending.setdefault("failures", {})
+    failures["consecutive"] = 0
+    failures["last_fingerprint"] = None
+
+
+def _find_existing_transcript(craig_id: str) -> pathlib.Path | None:
+    if not TRANSCRIPTS_DIR.exists():
+        return None
+    for candidate in sorted(TRANSCRIPTS_DIR.glob("*.md")):
+        try:
+            head = candidate.read_text(encoding="utf-8", errors="replace")[:5000]
+            frontmatter, _ = parse_frontmatter(head)
+        except OSError:
+            continue
+        identifiers = {
+            str(frontmatter.get(key) or "")
+            for key in ("craig_id", "recording_id", "recording")
+        }
+        if craig_id in identifiers or craig_id in head:
+            return candidate
+    return None
+
+
+def _first_commit_with_subject(subject: str) -> str | None:
+    result = git(
+        WIKI_PATH,
+        "log",
+        "--reverse",
+        "--format=%H",
+        f"--grep=^{re.escape(subject)}$",
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return next((line.strip() for line in result.stdout.splitlines() if line.strip()), None)
+
+
+def migrate_pending(pending: dict) -> dict:
+    """Upgrade a v1 pending and reconstruct safe checkpoints from disk/Git."""
+    pending["schema_version"] = 2
+    stages = pending.setdefault("stages", {})
+    for name in STAGE_NAMES:
+        stages.setdefault(name, {"status": "pending"})
+    pending.setdefault(
+        "failures",
+        {"consecutive": 0, "last_fingerprint": None, "history": []},
+    )
+    pending["failures"].setdefault("consecutive", 0)
+    pending["failures"].setdefault("last_fingerprint", None)
+    pending["failures"].setdefault("history", [])
+
+    craig_id = str(pending.get("craig_id") or "")
+    transcript_stage = stages["transcript"]
+    transcript_path: pathlib.Path | None = None
+    existing_rel = transcript_stage.get("path") or pending.get("transcript_path")
+    if existing_rel:
+        candidate = WIKI_PATH / str(existing_rel)
+        if candidate.is_file():
+            transcript_path = candidate
+    if transcript_path is None and craig_id:
+        transcript_path = _find_existing_transcript(craig_id)
+    if transcript_path:
+        transcript_rel = transcript_path.relative_to(WIKI_PATH).as_posix()
+        transcript_sha = _sha256(transcript_path)
+        if not (
+            _completed(stages.get("transcript"))
+            and stages["transcript"].get("sha256") == transcript_sha
+        ):
+            _complete_stage(
+                pending, "transcript", path=transcript_rel, sha256=transcript_sha
+            )
+        push_subject = f"raw: capture transcript {transcript_path.stem}"
+        push_commit = _first_commit_with_subject(push_subject)
+        if push_commit and not _completed(
+            stages.get("transcript_push"), transcript_sha
+        ):
+            _complete_stage(
+                pending,
+                "transcript_push",
+                transcript_sha256=transcript_sha,
+                commit=push_commit,
+            )
+        ingest_subject = f"wiki: ingest {transcript_path.stem}"
+        ingest_commit = _first_commit_with_subject(ingest_subject)
+        if ingest_commit and not _completed(
+            stages.get("ingest"), transcript_sha
+        ):
+            _complete_stage(
+                pending,
+                "ingest",
+                transcript_sha256=transcript_sha,
+                commit=ingest_commit,
+            )
+    return pending
+
+
+def _pending_age_hours(pending: dict) -> float:
+    raw = str(pending.get("first_seen_at") or "")
+    if not raw:
+        return 0.0
+    try:
+        first_seen = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if first_seen.tzinfo is None:
+            first_seen = first_seen.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0.0
+    return max(
+        0.0,
+        (datetime.now(timezone.utc) - first_seen.astimezone(timezone.utc)).total_seconds()
+        / 3600,
+    )
+
+
+def _error_fingerprint(phase: str, kind: str, detail: str) -> str:
+    normalized = re.sub(r"\b\d+\b", "<n>", detail.strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized)[:500]
+    return hashlib.sha256(
+        f"{phase}\0{kind}\0{normalized}".encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _classify_error(error: BaseException | str) -> tuple[str, str, bool]:
+    detail = (
+        f"{type(error).__name__}: {error}"
+        if isinstance(error, BaseException)
+        else str(error)
+    )[:1000]
+    lower = detail.lower()
+    non_retryable = isinstance(
+        error, (TypeError, PermissionError, FileNotFoundError)
+    ) or any(
+        marker in lower
+        for marker in (
+            "missing-env",
+            "schema-load",
+            "schema debrief introuvable",
+            "permission denied",
+            "required file",
+        )
+    )
+    retryable = isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) or any(
+        marker in lower
+        for marker in ("network", "timeout", "429", " 500", " 502", " 503", " 504", "not ready")
+    )
+    kind = "non-retryable" if non_retryable else "retryable" if retryable else "unknown"
+    return kind, detail, non_retryable
+
+
+def quarantine_pending(
+    pending_path: pathlib.Path,
+    pending: dict,
+    *,
+    failure_kind: str,
+    phase: str,
+    detail: str,
+    status: str = "quarantined",
+    age_hours: float | None = None,
+) -> dict:
+    FAILED_DIR.mkdir(parents=True, exist_ok=True)
+    failed_path = FAILED_DIR / pending_path.name
+    pending["failed_at"] = datetime.now(timezone.utc).isoformat()
+    pending["failure_kind"] = failure_kind
+    pending["last_phase"] = phase
+    if age_hours is not None:
+        pending["age_hours"] = round(age_hours, 3)
+    should_alert = not pending.get("failure_alerted_at")
+    if should_alert:
+        pending["failure_alerted_at"] = datetime.now(timezone.utc).isoformat()
+    if pending_path.exists():
+        save_pending(pending_path, pending)
+        os.replace(pending_path, failed_path)
+    else:
+        save_pending(failed_path, pending)
+    if should_alert:
+        message = (
+            f"⚠️ Craig `{pending.get('craig_id') or pending_path.stem}` "
+            f"mis en quarantaine ({failure_kind}, phase `{phase}`): {detail[:300]}"
+        )
+        thread_id = pending.get("pipeline_thread_id")
+        if thread_id:
+            discord_post(str(thread_id), message)
+        discord_post(DISCORD_HOME_CHANNEL, message)
+    return {
+        "craig_id": pending.get("craig_id") or pending_path.stem,
+        "status": status,
+        "phase": phase,
+        "detail": detail,
+        "failed_path": str(failed_path.relative_to(WIKI_PATH)),
+    }
+
+
+def record_failure(
+    pending_path: pathlib.Path,
+    pending: dict,
+    phase: str,
+    error: BaseException | str,
+) -> dict:
+    kind, detail, immediate = _classify_error(error)
+    fingerprint = _error_fingerprint(phase, kind, detail)
+    failures = pending.setdefault(
+        "failures", {"consecutive": 0, "last_fingerprint": None, "history": []}
+    )
+    consecutive = (
+        int(failures.get("consecutive") or 0) + 1
+        if failures.get("last_fingerprint") == fingerprint
+        else 1
+    )
+    failures["consecutive"] = consecutive
+    failures["last_fingerprint"] = fingerprint
+    failures.setdefault("history", []).append(
+        {
+            "phase": phase,
+            "kind": kind,
+            "detail": detail,
+            "fingerprint": fingerprint,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    failures["history"] = failures["history"][-10:]
+    save_pending(pending_path, pending)
+    if immediate or consecutive >= 3:
+        return quarantine_pending(
+            pending_path,
+            pending,
+            failure_kind=kind,
+            phase=phase,
+            detail=detail,
+        )
+    return {
+        "craig_id": pending.get("craig_id") or pending_path.stem,
+        "status": "retryable-error",
+        "phase": phase,
+        "detail": detail,
+        "fingerprint": fingerprint,
+        "consecutive": consecutive,
+    }
 
 
 # ----------------------------- scan.py wrapper -----------------------------
@@ -1084,7 +1364,6 @@ def generate_debrief(transcript_path: pathlib.Path, schema: dict) -> tuple[dict 
             LLM_CONFIG,
             messages,
             purpose="generate meeting debrief JSON",
-            response_format={"type": "json_object"},
         )
         if err:
             last_err = err
@@ -1152,7 +1431,7 @@ def run_debrief_py(debrief_path: pathlib.Path) -> tuple[int, dict]:
 # ----------------------------- self-cron removal -----------------------------
 
 def _find_followup_cron_id() -> str | None:
-    """Parse `hermes cron list` and return the job id of the
+    """Parse `hermes cron list --all` and return the job id of the
     `craig-watch-followup` cron, or None if absent. The CLI prints
     blocks like `<hex> [active]` followed by `  Name: <name>` lines —
     the trailing ` [active]` on the id line means we can't match the
@@ -1161,7 +1440,7 @@ def _find_followup_cron_id() -> str | None:
     if not HERMES_CLI.exists():
         return None
     list_proc = subprocess.run(
-        [str(HERMES_CLI), "cron", "list"],
+        [str(HERMES_CLI), "cron", "list", "--all"],
         capture_output=True, text=True, timeout=15,
     )
     lines = list_proc.stdout.splitlines()
@@ -1276,7 +1555,8 @@ def _ensure_status_thread(pending: dict, pending_path: pathlib.Path,
 
 
 def process_pending(pending_path: pathlib.Path) -> dict:
-    pending = load_pending(pending_path)
+    pending = migrate_pending(load_pending(pending_path))
+    save_pending(pending_path, pending)
     craig_id = pending.get("craig_id") or pending_path.stem
     channel_id = pending.get("channel_id") or CRAIG_EVENTS_CHANNEL_ID
     panel_id = pending.get("message_id")
@@ -1284,22 +1564,40 @@ def process_pending(pending_path: pathlib.Path) -> dict:
 
     summary: dict = {"craig_id": craig_id, "phase": "start"}
 
+    age_hours = _pending_age_hours(pending)
+    if age_hours > MAX_AGE_HOURS:
+        return quarantine_pending(
+            pending_path,
+            pending,
+            failure_kind="expired",
+            phase="expiry-check",
+            detail=f"pending age {age_hours:.2f}h exceeds {MAX_AGE_HOURS:.2f}h",
+            status="expired",
+            age_hours=age_hours,
+        )
+
+    if _completed(pending["stages"].get("debrief_post")):
+        delete_pending(pending_path)
+        return {"craig_id": craig_id, "status": "done", "phase": "done"}
+
     if panel_id:
         panel, err = discord_get_message(channel_id, panel_id)
         if err:
-            summary.update({"phase": "panel-refetch-failed", "detail": err})
-            return summary
+            return record_failure(
+                pending_path, pending, "panel-refetch", err
+            )
         body = extract_message_text(panel or {})
         if not ENDED_RE.search(body):
-            summary.update({"phase": "still-recording"})
+            summary.update({"status": "still-recording", "phase": "still-recording"})
             return summary
     # Manual pendings without a panel_id (debug runs) skip the refetch
     # and assume the recording is already over.
 
     thread_id, err = _ensure_status_thread(pending, pending_path, date_hhmm)
     if err or not thread_id:
-        summary.update({"phase": "status-init-failed", "detail": err})
-        return summary
+        return record_failure(
+            pending_path, pending, "status-init", err or "missing thread id"
+        )
 
     def post_phase(kind: str, text: str) -> None:
         _, perr = discord_post(thread_id, fmt_phase(kind, text))
@@ -1307,49 +1605,79 @@ def process_pending(pending_path: pathlib.Path) -> dict:
             # Don't fail the pipeline on a status post error — log and move on.
             summary.setdefault("status_post_errors", []).append(perr)
 
-    post_phase("inprogress", "Téléchargement Drive…")
+    # Phase 2 — scan.py with live progress messages in the thread, unless
+    # migration/checkpoint reconstruction already proved the transcript.
+    transcript_stage = pending["stages"].get("transcript") or {}
+    transcript_rel = transcript_stage.get("path")
+    transcript_abs = WIKI_PATH / transcript_rel if transcript_rel else None
+    transcript_sha = transcript_stage.get("sha256")
+    transcript_checkpoint_valid = bool(
+        _completed(transcript_stage)
+        and transcript_abs
+        and transcript_abs.is_file()
+        and _sha256(transcript_abs) == transcript_sha
+    )
+    scan_result: dict = {"status": "skipped", "reason": "checkpoint"}
+    if not transcript_checkpoint_valid:
+        post_phase("inprogress", "Téléchargement Drive…")
 
-    # Phase 2 — scan.py with live progress messages in the thread.
-    posted_phases: set[str] = set()
+        posted_phases: set[str] = set()
 
-    def on_progress(ev: dict) -> None:
-        phase = ev.get("phase")
-        if phase in posted_phases:
-            return
-        posted_phases.add(phase or "")
-        if phase == "zip-found":
-            mb = (ev.get("size_bytes") or 0) / 1e6
-            post_phase("done", f"Zip Drive trouvé ({mb:.1f} MB).")
-            post_phase("inprogress", "Transcription Groq Whisper…")
-        elif phase == "groq-start":
-            # zip-found already announced groq; only post if zip-found
-            # wasn't seen (unusual).
-            if "zip-found" not in posted_phases:
+        def on_progress(ev: dict) -> None:
+            phase = ev.get("phase")
+            if phase in posted_phases:
+                return
+            posted_phases.add(phase or "")
+            if phase == "zip-found":
+                mb = (ev.get("size_bytes") or 0) / 1e6
+                post_phase("done", f"Zip Drive trouvé ({mb:.1f} MB).")
                 post_phase("inprogress", "Transcription Groq Whisper…")
-        elif phase == "writing-raw":
-            post_phase("done", "Transcription terminée, écriture du fichier…")
+            elif phase == "groq-start":
+                if "zip-found" not in posted_phases:
+                    post_phase("inprogress", "Transcription Groq Whisper…")
+            elif phase == "writing-raw":
+                post_phase("done", "Transcription terminée, écriture du fichier…")
 
-    rc, scan_result, _ = run_scan(craig_id, on_progress)
+        rc, scan_result, _ = run_scan(craig_id, on_progress)
 
-    if scan_result.get("status") == "error":
-        post_phase("error", f"Scan: {scan_result.get('reason')} — "
-                            f"{scan_result.get('detail','')[:200]}")
-        summary.update({"phase": "scan-error", "scan": scan_result})
-        return summary
+        if scan_result.get("status") == "error":
+            post_phase("error", f"Scan: {scan_result.get('reason')} — "
+                                f"{scan_result.get('detail','')[:200]}")
+            return record_failure(
+                pending_path,
+                pending,
+                "scan",
+                f"{scan_result.get('reason')}: {scan_result.get('detail', '')}",
+            )
 
-    if scan_result.get("status") == "skipped" and scan_result.get("reason") == "already-transcribed":
-        as_basename = scan_result.get("as", "")
-        transcript_rel = f"raw/transcripts/{as_basename}" if as_basename else None
-        post_phase("done", f"Transcript déjà présent (`{as_basename}`), reprise du pipeline.")
-    else:
-        transcript_rel = scan_result.get("path")
+        if scan_result.get("status") == "skipped" and scan_result.get("reason") == "already-transcribed":
+            as_basename = scan_result.get("as", "")
+            transcript_rel = f"raw/transcripts/{as_basename}" if as_basename else None
+            post_phase("done", f"Transcript déjà présent (`{as_basename}`), reprise du pipeline.")
+        else:
+            transcript_rel = scan_result.get("path")
 
-    if not transcript_rel:
-        post_phase("error", f"Scan: pas de path retourné — {scan_result.get('reason','')}")
-        summary.update({"phase": "scan-no-path", "scan": scan_result})
-        return summary
+        if not transcript_rel:
+            post_phase("error", f"Scan: pas de path retourné — {scan_result.get('reason','')}")
+            return record_failure(
+                pending_path, pending, "scan", "scan returned no transcript path"
+            )
 
-    transcript_abs = WIKI_PATH / transcript_rel
+        transcript_abs = WIKI_PATH / transcript_rel
+        if not transcript_abs.is_file():
+            return record_failure(
+                pending_path,
+                pending,
+                "transcript",
+                FileNotFoundError(str(transcript_abs)),
+            )
+        transcript_sha = _sha256(transcript_abs)
+        _complete_stage(
+            pending, "transcript", path=transcript_rel, sha256=transcript_sha
+        )
+        save_pending(pending_path, pending)
+
+    assert transcript_abs is not None and transcript_sha is not None
     duration_s = int(scan_result.get("duration_s") or 0)
     if not duration_s:
         try:
@@ -1363,26 +1691,39 @@ def process_pending(pending_path: pathlib.Path) -> dict:
                            f"({duration_s//60}m {duration_s%60}s).")
 
     # Phase 3 — git push transcript.
-    post_phase("inprogress", "Commit + push GitHub (transcript)…")
-    sha, push_err = git_commit_push(
-        WIKI_PATH, [transcript_rel],
-        f"raw: capture transcript {transcript_abs.stem}",
-    )
-    if push_err:
-        post_phase("error", f"Push transcript: {push_err[:200]}")
-        summary.update({"phase": "push-error", "detail": push_err})
-        return summary
-    if sha:
-        link = github_link(WIKI_PATH, sha)
-        push_text = f"Pushé : [`{sha}`]({link})." if link.startswith("http") else f"Pushé (`{sha}`)."
-    else:
-        push_text = "Push transcript : rien à pusher (déjà sur origin)."
-    post_phase("done", push_text)
+    if not _completed(
+        pending["stages"].get("transcript_push"), transcript_sha
+    ):
+        post_phase("inprogress", "Commit + push GitHub (transcript)…")
+        sha, push_err = git_commit_push(
+            WIKI_PATH, [transcript_rel],
+            f"raw: capture transcript {transcript_abs.stem}",
+        )
+        if push_err:
+            post_phase("error", f"Push transcript: {push_err[:200]}")
+            return record_failure(
+                pending_path, pending, "transcript-push", push_err
+            )
+        if sha:
+            link = github_link(WIKI_PATH, sha)
+            push_text = f"Pushé : [`{sha}`]({link})." if link.startswith("http") else f"Pushé (`{sha}`)."
+        else:
+            push_text = "Push transcript : rien à pusher (déjà sur origin)."
+        post_phase("done", push_text)
+        _complete_stage(
+            pending,
+            "transcript_push",
+            transcript_sha256=transcript_sha,
+            commit=sha,
+        )
+        save_pending(pending_path, pending)
 
     # Phase 4 — llm-wiki ingest.
-    post_phase("inprogress", "Ingest llm-wiki (GPT/OAuth, éditions bufferisées)…")
-    ingest = llm_wiki_ingest(transcript_abs)
-    summary["ingest"] = ingest
+    ingest = {"status": "checkpoint"}
+    if not _completed(pending["stages"].get("ingest"), transcript_sha):
+        post_phase("inprogress", "Ingest llm-wiki (GPT/OAuth, éditions bufferisées)…")
+        ingest = llm_wiki_ingest(transcript_abs)
+        summary["ingest"] = ingest
     n_dropped = len(ingest.get("dropped_edits") or [])
     if ingest["status"] == "committed":
         dropped_note = (f" ⚠️ {n_dropped} édition(s) écartée(s) au dry-run "
@@ -1403,14 +1744,27 @@ def process_pending(pending_path: pathlib.Path) -> dict:
     elif ingest["status"] in ("aborted", "llm-error"):
         post_phase("error",
                    f"Ingest aborté ({ingest.get('reason','?')[:200]}). "
-                   f"Transcript reste committé, debrief continue.")
+                   f"Transcript reste committé, reprise ultérieure.")
+        return record_failure(
+            pending_path,
+            pending,
+            "ingest",
+            f"{ingest.get('reason')}: {ingest.get('detail', '')}",
+        )
+    if ingest["status"] in ("committed", "no-op"):
+        _complete_stage(
+            pending,
+            "ingest",
+            transcript_sha256=transcript_sha,
+            commit=ingest.get("sha"),
+        )
+        save_pending(pending_path, pending)
 
-    # Always proceed to debrief even on ingest abort.
     if duration_s and duration_s < MIN_DURATION_S:
         post_phase("done", f"Recording court ({duration_s}s < {MIN_DURATION_S}s) — "
                            f"pas de debrief généré.")
         delete_pending(pending_path)
-        summary.update({"phase": "done-short"})
+        summary.update({"status": "done-short", "phase": "done-short"})
         return summary
 
     post_phase("inprogress", "Génération debrief (GPT/OAuth)…")
@@ -1421,8 +1775,7 @@ def process_pending(pending_path: pathlib.Path) -> dict:
         schema = json.loads(DEBRIEF_SCHEMA.read_text(encoding="utf-8"))
     except Exception as exc:
         post_phase("error", f"Schema debrief introuvable: {exc}")
-        summary.update({"phase": "schema-load-error", "detail": str(exc)})
-        return summary
+        return record_failure(pending_path, pending, "schema-load", exc)
 
     if debrief_path.exists():
         try:
@@ -1437,20 +1790,42 @@ def process_pending(pending_path: pathlib.Path) -> dict:
                 pass
 
     if not debrief_path.exists():
-        debrief_data, gen_err = generate_debrief(transcript_abs, schema)
+        try:
+            debrief_data, gen_err = generate_debrief(transcript_abs, schema)
+        except Exception as exc:
+            post_phase("error", f"Génération debrief LLM échouée : {exc}")
+            return record_failure(
+                pending_path, pending, "debrief-generation", exc
+            )
         if not debrief_data:
             post_phase("error", f"Génération debrief LLM échouée : "
                                 f"{(gen_err or 'unknown')[:200]}")
-            summary.update({"phase": "debrief-generation-failed", "detail": gen_err})
-            return summary
+            return record_failure(
+                pending_path,
+                pending,
+                "debrief-generation",
+                gen_err or "unknown",
+            )
         debrief_path.write_text(
             json.dumps(debrief_data, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    _complete_stage(
+        pending,
+        "debrief_generation",
+        transcript_sha256=transcript_sha,
+        path=debrief_path.relative_to(WIKI_PATH).as_posix(),
+        sha256=_sha256(debrief_path),
+    )
+    save_pending(pending_path, pending)
 
     # Phase 6 — debrief.py (POST recap + thread in #hermes-perso).
-    rc, deb_result = run_debrief_py(debrief_path)
-    summary["debrief_py"] = deb_result
+    deb_result = {"status": "skipped", "reason": "checkpoint"}
+    if not _completed(
+        pending["stages"].get("debrief_post"), transcript_sha
+    ):
+        rc, deb_result = run_debrief_py(debrief_path)
+        summary["debrief_py"] = deb_result
     if deb_result.get("status") == "posted":
         deb_thread_id = deb_result.get("thread_id")
         post_phase("done",
@@ -1461,18 +1836,41 @@ def process_pending(pending_path: pathlib.Path) -> dict:
     else:
         post_phase("error", f"Debrief.py : {deb_result.get('reason','?')} — "
                             f"{deb_result.get('detail','')[:200]}")
-        summary.update({"phase": "debrief-py-error"})
-        return summary
+        return record_failure(
+            pending_path,
+            pending,
+            "debrief-post",
+            f"{deb_result.get('reason')}: {deb_result.get('detail', '')}",
+        )
 
+    _complete_stage(
+        pending,
+        "debrief_post",
+        transcript_sha256=transcript_sha,
+        result=deb_result.get("status"),
+    )
+    save_pending(pending_path, pending)
     post_phase("done", "Pipeline terminé.")
     delete_pending(pending_path)
-    summary.update({"phase": "done"})
+    summary.update({"status": "done", "phase": "done"})
     return summary
 
 
 # ----------------------------- main -----------------------------
 
 def main() -> int:
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = LOCK_PATH.open("a+")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps({
+            "status": "already-running",
+            "processed_count": 0,
+            "summaries": [],
+        }, ensure_ascii=False))
+        return 0
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--craig-id", help="Process only this craig_id (debug).")
     ap.add_argument("--ingest-only", metavar="TRANSCRIPT_REL", help=(
@@ -1506,22 +1904,40 @@ def main() -> int:
         try:
             out_summaries.append(process_pending(p))
         except Exception as exc:
-            out_summaries.append({
-                "craig_id": p.stem,
-                "phase": "exception",
-                "detail": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc()[-1000:],
-            })
+            try:
+                pending = migrate_pending(load_pending(p))
+                out_summaries.append(
+                    record_failure(p, pending, "exception", exc)
+                )
+            except Exception:
+                out_summaries.append({
+                    "craig_id": p.stem,
+                    "status": "retryable-error",
+                    "phase": "exception",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc()[-1000:],
+                })
 
     cron_action = maybe_self_delete_cron() if not args.craig_id else {"status": "skipped", "reason": "debug-mode"}
 
+    quarantined = any(
+        summary.get("status") in {"quarantined", "expired"}
+        for summary in out_summaries
+    )
+    active_errors = any(
+        summary.get("status") == "retryable-error"
+        or summary.get("phase") == "exception"
+        for summary in out_summaries
+    )
+    returncode = 2 if quarantined else 1 if active_errors else 0
+
     print(json.dumps({
-        "status": "ok",
+        "status": "ok" if returncode == 0 else "error",
         "processed_count": len(out_summaries),
         "summaries": out_summaries,
         "cron_action": cron_action,
     }, ensure_ascii=False))
-    return 0
+    return returncode
 
 
 if __name__ == "__main__":

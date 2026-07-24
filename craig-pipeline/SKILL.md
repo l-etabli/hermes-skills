@@ -1,7 +1,7 @@
 ---
 name: craig-pipeline
-description: "Orchestrateur déterministe Python qui pilote toute la chaîne post-Craig (refetch panel Discord -> scan.py -> push transcript -> ingest llm-wiki bufferisé -> génération debrief -> debrief.py post + thread). Ingest et debrief passent par `hermes -z` avec le provider GPT/OAuth configuré. Tout le reste est code → push garanti, idempotence triviale, monitoring Discord granulaire à chaque phase. Invoqué uniquement par le cron craig-watch-followup."
-version: 1.3.0
+description: "Orchestrateur déterministe Python qui pilote toute la chaîne post-Craig avec checkpoints SHA-256, circuit breaker et quarantaine. Ingest et debrief passent par `hermes -z`; le cron lance directement le runner no-agent."
+version: 2.0.0
 platforms: [linux]
 metadata:
   hermes:
@@ -34,6 +34,9 @@ required_environment_variables:
   - name: MEETING_DEBRIEF_MIN_DURATION_S
     prompt: "Durée min d'un recording pour mériter un debrief (défaut 180). Sous le seuil : pipeline post le ✅ final 'recording court' et supprime le pending sans appel LLM debrief."
     required_for: optional
+  - name: CRAIG_PIPELINE_MAX_AGE_HOURS
+    prompt: "Durée de vie absolue d'un pending avant quarantaine (défaut 6 heures)."
+    required_for: optional
   - name: HERMES_SKILLS_DIR
     prompt: "Racine des skills partagés (défaut /opt/data/skills-shared). Le pipeline appelle ./craig-transcript-record/scan.py et ./meeting-debrief/debrief.py en subprocess à partir de cette racine."
     required_for: optional
@@ -54,14 +57,15 @@ required_environment_variables:
 
 ⚠️ **Ce skill ne doit JAMAIS être invoqué par mention utilisateur.** Il est invoqué exclusivement par le cron `craig-watch-followup` (auto-créé par `craig-listener` quand un nouveau recording arrive, auto-supprimé par ce script quand `.craig-pending/` se vide).
 
-Le tick LLM qui exécute ce cron doit faire **UNE SEULE CHOSE** :
+Le cron est un job upstream **sans agent**. Il exécute directement :
 
 ```bash
-uv run --with requests --with jsonschema --with pyyaml \
-    /opt/data/skills-shared/craig-pipeline/pipeline.py
+/opt/data/scripts/craig-pipeline-runner.sh
 ```
 
-Puis reporter la sortie JSON. **Ne touche à rien d'autre** : pas de git, pas d'API Discord, pas d'écriture wiki, pas de skill craig-watch / llm-wiki / meeting-debrief activé en parallèle. Le script s'occupe de tout.
+Le runner garde le succès silencieux, journalise localement une sortie bornée
+et propage tout code non nul au scheduler. Aucun LLM n'orchestre ou ne
+« rattrape » une phase.
 
 ## Pourquoi ce skill existe
 
@@ -118,15 +122,19 @@ Quand .craig-pending/ vide :
 
 ## Idempotence et reprise sur crash
 
-Si le script crashe (kill -9, OOM, container restart) le pending JSON reste. Au tick suivant, le pipeline reprend depuis le début pour ce pending — toutes les étapes sont idempotentes :
+Le pending schema v2 enregistre atomiquement chaque phase réussie et le SHA-256
+du transcript. Au tick suivant, le pipeline reprend à la première phase
+incomplète :
 
-- `scan.py` détecte le `drive_id` déjà présent dans le frontmatter raw → retourne `skipped/already-transcribed`. Le pipeline reconstruit le path et continue.
-- `git commit` no-op si rien à committer.
-- `llm-wiki ingest` rejoue son plan/agent loop ; le LLM voit le log existant et propose des éditions minimales (idempotence sémantique, pas binaire — accepte la dépense LLM en cas de retry).
+- un pending v1 est migré depuis le transcript existant et l'historique Git ;
+- un checkpoint ingest `completed` pour le même SHA interdit tout second ingest ;
 - `generate_debrief` skip si `raw/debriefs/<basename>.json` existe et valide.
 - `debrief.py` skip via `find_existing_debrief()` (matché sur `transcript_sha256`).
 
-Le `pipeline_status_message_id` est mémorisé dans le pending JSON dès le premier post → sur retry, on PATCH le même message au lieu d'en poster un nouveau.
+Une erreur non retryable met immédiatement le recording dans `.craig-failed/`.
+Trois fingerprints consécutifs identiques font de même. Un pending âgé de plus
+de six heures expire avant scan/ingest/debrief. Chaque quarantaine produit une
+seule alerte et conserve les dix dernières erreurs.
 
 ## Format du status message
 

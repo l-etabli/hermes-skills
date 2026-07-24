@@ -28,7 +28,7 @@ def test_followup_cron_delivery_stays_local(monkeypatch, tmp_path):
 
     def fake_run(command, **_kwargs):
         calls.append(command)
-        if command[-2:] == ["cron", "list"]:
+        if command[-3:] == ["cron", "list", "--all"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         return SimpleNamespace(returncode=0, stdout="created", stderr="")
 
@@ -45,6 +45,11 @@ def test_followup_cron_delivery_stays_local(monkeypatch, tmp_path):
     ]
     deliver_index = create_command.index("--deliver")
     assert create_command[deliver_index + 1] == "local"
+    assert create_command[-3:] == [
+        "--script",
+        "craig-pipeline-runner.sh",
+        "--no-agent",
+    ]
 
 
 def test_existing_followup_cron_is_not_recreated(monkeypatch, tmp_path):
@@ -52,9 +57,36 @@ def test_existing_followup_cron_is_not_recreated(monkeypatch, tmp_path):
     monkeypatch.setattr(listener.pathlib.Path, "exists", lambda _self: True)
     run = lambda *_args, **_kwargs: SimpleNamespace(
         returncode=0,
-        stdout=f"Name: {listener.FOLLOWUP_CRON_NAME}",
+        stdout=(
+            "  abcdef123456 [active]\n"
+            f"    Name:      {listener.FOLLOWUP_CRON_NAME}\n"
+        ),
         stderr="",
     )
     monkeypatch.setattr(listener.subprocess, "run", run)
 
     assert listener.ensure_followup_cron() == "already-running"
+
+
+def test_paused_followup_cron_is_not_recreated_or_resumed(monkeypatch, tmp_path):
+    listener = _load_listener(monkeypatch, tmp_path)
+    monkeypatch.setattr(listener.pathlib.Path, "exists", lambda _self: True)
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "  8a3f6b097b60 [paused]\n"
+                "    Name:      craig-watch-followup\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(listener.subprocess, "run", fake_run)
+
+    assert listener.ensure_followup_cron() == "paused"
+    assert calls == [[
+        "/opt/hermes/.venv/bin/hermes", "cron", "list", "--all"
+    ]]

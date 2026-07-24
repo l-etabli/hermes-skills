@@ -251,47 +251,23 @@ def invoke_scan(craig_id: str) -> tuple[int, dict, list[dict]]:
 
 
 FOLLOWUP_CRON_NAME = "craig-watch-followup"
+FOLLOWUP_CRON_SCRIPT = "craig-pipeline-runner.sh"
 
 
-def _followup_cron_prompt(hermes_cli: str) -> str:
-    # The follow-up cron's only job is to drive craig-pipeline/pipeline.py.
-    # That script is the deterministic orchestrator (refetch panel ->
-    # scan.py -> push -> llm-wiki ingest agent loop with guards ->
-    # debrief generation -> debrief.py post -> self-cron-remove). The LLM
-    # does NOT orchestrate any of that — every prior attempt to let it
-    # ended up with skipped pushes, vandalised index.md, or hallucinated
-    # status reports. Keep this prompt minimal and DO NOT re-add steps.
-    return f"""\
-Tu es active par un cron tick toutes les 5 min pour faire avancer les
-recordings Craig pending.
-
-Procedure stricte (UNE SEULE chose a faire) :
-
-1. Lance le script craig-pipeline et capture sa sortie :
-
-   uv run /opt/data/skills-shared/craig-pipeline/pipeline.py
-
-2. Termine ta session SANS rien dire d'autre. Aucun message Discord
-   (le script s'en occupe : status thread dans #craig-events, recap
-   debrief dans #hermes-perso, ✅ final + cron remove quand termine).
-   Si tu veux logger la sortie JSON pour debug, fais-le SEULEMENT
-   dans un message de log non-Discord (ex. via emit_progress dans le
-   sandbox terminal). NE poste rien dans le chat.
-
-INTERDICTIONS strictes (chaque ligne ci-dessous a deja ete observee
-en prod et a cause des bugs) :
-- NE poste PAS dans Discord, ni en reply au panel Craig, ni dans
-  #hermes-perso, ni nulle part. Le script gere toute la visibilite.
-  Si tu vois "Suivi craig-watch termine" dans la sortie de
-  maybe_self_delete_cron, c'est que le SCRIPT vient deja de poster.
-  NE le re-poste PAS. C'est la cause d'un spam de ✅ doublons.
-- NE touche pas a git, ne lance pas scan.py / debrief.py / ingest
-  llm-wiki / craig-watch a la main. Le script compose tout cela.
-- NE relance PAS pipeline.py si le premier run a deja tourne (idem
-  spam : un seul run par tick).
-- Si le script echoue (rc != 0 ou status=error global), termine
-  silencieusement. NE tente pas de "rattraper" a la main. Le tick
-  suivant retentera automatiquement (le pipeline est idempotent)."""
+def parse_followup_cron(output: str) -> dict | None:
+    """Return the exact Craig follow-up job from ``cron list --all``."""
+    current: dict | None = None
+    for line in output.splitlines():
+        match = re.match(r"^\s*([0-9a-fA-F-]{6,})\s+\[([^\]]+)\]\s*$", line)
+        if match:
+            current = {"id": match.group(1), "state": match.group(2).lower()}
+            continue
+        name = re.match(r"^\s*Name:\s*(.+?)\s*$", line)
+        if current and name:
+            if name.group(1) == FOLLOWUP_CRON_NAME:
+                return current
+            current = None
+    return None
 
 
 def ensure_followup_cron() -> str:
@@ -304,10 +280,15 @@ def ensure_followup_cron() -> str:
         return f"failed: hermes-cli-not-found: {hermes_cli}"
 
     list_proc = subprocess.run(
-        [hermes_cli, "cron", "list"],
+        [hermes_cli, "cron", "list", "--all"],
         capture_output=True, text=True, timeout=15,
     )
-    if FOLLOWUP_CRON_NAME in list_proc.stdout:
+    if list_proc.returncode != 0:
+        return f"failed: cron-list: {(list_proc.stderr or list_proc.stdout)[:200]}"
+    existing = parse_followup_cron(list_proc.stdout)
+    if existing and existing["state"] == "paused":
+        return "paused"
+    if existing:
         return "already-running"
 
     proc = subprocess.run(
@@ -320,14 +301,8 @@ def ensure_followup_cron() -> str:
             # deliver=origin and dumps a wrapped "Cronjob Response" into the
             # parent #craig-events channel on every tick.
             "--deliver", "local",
-            # craig-pipeline is the only skill the tick LLM needs — it
-            # drives pipeline.py which composes scan.py + debrief.py
-            # internally. craig-watch / llm-wiki / meeting-debrief are
-            # intentionally NOT attached: their presence in the tick's
-            # context tempted the LLM into running them in parallel and
-            # double-orchestrating.
-            "--skill", "craig-pipeline",
-            _followup_cron_prompt(hermes_cli),
+            "--script", FOLLOWUP_CRON_SCRIPT,
+            "--no-agent",
         ],
         capture_output=True, text=True, timeout=30,
     )
