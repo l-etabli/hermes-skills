@@ -178,7 +178,7 @@ Comme `scan.py` a tourné synchronement, ces phases sont déjà toutes passées 
 - **Ne pas filtrer par channel ID dans la prose ou en code.** Le routing Discord (permissions de catégorie) garantit déjà l'isolation.
 - **Ne PAS poll Drive depuis le LLM** en attendant la fin du recording. Le rôle du listener est de capter l'événement et déléguer à craig-watch via le pending state. Bloquer le LLM pendant des heures = anti-pattern.
 - **Pas de parallélisme** sur plusieurs Recording ID dans le même run.
-- **Pas de `git remote set-url`, pas de `export GITHUB_TOKEN`** — credential helper côté infra.
+- **Pas de `git remote set-url`, `git credential fill`, ni `export GITHUB_TOKEN`** — utilise `/usr/local/bin/hermes-wiki-git pull|push` pour le réseau.
 
 ## Verification
 

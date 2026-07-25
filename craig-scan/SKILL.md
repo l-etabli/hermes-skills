@@ -119,7 +119,7 @@ uv run --with google-auth --with google-api-python-client --with requests \
 ```
 
 Lis le JSON renvoyé par `scan.py`. Pour chaque `processed` :
-1. `cd "$WIKI_PATH" && git pull --rebase && git add <path> && git commit -m "raw: capture transcript ..." && git push`
+1. `cd "$WIKI_PATH" && /usr/local/bin/hermes-wiki-git pull && git add <path> && git commit -m "raw: capture transcript ..." && /usr/local/bin/hermes-wiki-git push`
 2. Active `llm-wiki` et applique `ingest` sur le fichier.
 
 Pour chaque `error`, log et continue avec l'ID suivant. Pour chaque `skipped`, silence.
@@ -140,7 +140,7 @@ Pour chaque `error`, log et continue avec l'ID suivant. Pour chaque `skipped`, s
 - **`discover.py` ne touche pas Drive** : il ne fait que lire l'historique Discord. Si un recording est dans la liste, ça ne garantit pas que le zip soit déjà sur Drive (cook+upload Craig peut être en retard). C'est `scan.py` qui poll Drive (timeout 20 min).
 - **Limite 100 messages** : c'est la limite single-page Discord. Si le backlog est plus profond, paginer (pas implémenté pour l'instant — prévenir l'utilisateur si on suspecte un backlog > 100).
 - **Pas de filtrage par channel/instance** : on lit `$CRAIG_EVENTS_CHANNEL_ID` qui est l'unique channel auquel cette instance a accès dans cette catégorie. Discord garantit l'isolation.
-- **Pas de `git remote set-url`, pas de `export GITHUB_TOKEN`** — credential helper côté infra.
+- **Pas de `git remote set-url`, `git credential fill`, ni `export GITHUB_TOKEN`** — utilise `/usr/local/bin/hermes-wiki-git pull|push`.
 
 ## Verification
 

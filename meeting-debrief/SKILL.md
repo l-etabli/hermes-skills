@@ -1,13 +1,13 @@
 ---
 name: meeting-debrief
-description: "Après chaque transcript Craig ingéré dans le wiki (post-craig-watch processed), génère un debrief structuré (TLDR + décisions + open questions + action items typés) et le poste dans CRAIG_HOME_CHANNEL avec un thread de validation. Phase 2 : dispatche les actions validées vers github-issues / hermes-cron / google-workspace / obsidian / linear."
+description: "Après chaque transcript Craig ingéré dans le wiki (post-craig-watch processed), génère un debrief structuré (TLDR + décisions + open questions + action items typés) et le poste dans CRAIG_HOME_CHANNEL avec un thread de validation. Phase 2 : dispatche les actions validées vers telluris-github-issues / hermes-cron / google-workspace / obsidian / linear."
 version: 0.1.0
 platforms: [linux]
 metadata:
   hermes:
     tags: [voice, transcript, debrief, discord, llm-wiki]
     category: voice
-    related_skills: [craig-watch, llm-wiki, github-issues]
+    related_skills: [craig-watch, llm-wiki, telluris-github-issues]
     requires_toolsets: [terminal]
 required_environment_variables:
   - name: WIKI_PATH
@@ -26,7 +26,7 @@ required_environment_variables:
 
 # Meeting Debrief
 
-Transforme un transcript Craig (déjà ingéré dans le wiki par `craig-watch` + `llm-wiki`) en un debrief humain (TLDR + décisions + actions à valider) posté dans `CRAIG_HOME_CHANNEL`. Un thread est ouvert sous le recap : l'utilisateur valide / refuse les actions ; à sa réponse, ce skill dispatche chaque action validée vers le bon skill cible (`github-issues`, `hermes-cron` natif, `google-workspace`, `obsidian`, `linear`).
+Transforme un transcript Craig (déjà ingéré dans le wiki par `craig-watch` + `llm-wiki`) en un debrief humain (TLDR + décisions + actions à valider) posté dans `CRAIG_HOME_CHANNEL`. Un thread est ouvert sous le recap : l'utilisateur valide / refuse les actions ; à sa réponse, ce skill dispatche chaque action validée vers le bon skill cible (`telluris-github-issues`, `hermes-cron` natif, `google-workspace`, `obsidian`, `linear`).
 
 ## When to Use
 
@@ -122,7 +122,7 @@ Quand tu reçois un message Discord :
    ```
 
 4. **Lis le `to_invoke[]`** retourné. Pour chaque action, invoque le skill cible correspondant à `suggested_action.kind` :
-   - `github-issue` → skill `github-issues` (titre = `description`, body = `suggested_action.body` si fourni).
+   - `github-issue` → skill `telluris-github-issues` (cherche d'abord un doublon ; titre = `description`, body = `suggested_action.body` si fourni).
    - `hermes-cron` → CLI `hermes` natif (`hermes cron add ...`) avec `name = target`, `cron = when`.
    - `gmail-draft` → skill `google-workspace` (compose draft).
    - `obsidian-note` → skill `obsidian` (write note at `target`).

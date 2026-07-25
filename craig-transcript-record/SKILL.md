@@ -65,14 +65,14 @@ Avant de lancer, observe ces règles propres à l'environnement Hermes :
 
 - **Python via `uv run`, jamais `pip`.** L'image upstream n'a pas pip. Pour le script : `uv run --with google-auth --with google-api-python-client --with requests /opt/data/skills-shared/craig-transcript-record/scan.py --craig-id <ID>`.
 - **Workdir = `tempfile.mkdtemp()`.** Ne jamais écrire un audio ou un script dans `/opt/data/`, `/opt/hermes/`, ou `$WIKI_PATH`. Le script gère ça lui-même.
-- **Auth git = transparente.** Un credential helper côté infra lit `$GITHUB_TOKEN` à chaque op. Tu fais juste `git pull / commit / push` — pas de `git remote set-url`, pas d'`export GITHUB_TOKEN`. Ces commandes déclenchent le scanner de sécurité Hermes pour rien.
+- **Auth git bornée.** Le sandbox retire `$GITHUB_TOKEN`. Utilise `/usr/local/bin/hermes-wiki-git pull|push` pour les opérations réseau ; le wrapper lit le token frais en interne et cible uniquement `/opt/data/wiki`. `git add` / `git commit` restent des commandes locales normales.
 - **Env vars chargées au container start** via Docker `env_file:`. Accès via `os.environ[...]`. Ne tente pas de les recharger d'un .env.
 
 ### 1. Pre-flight
 
 ```bash
 command -v uv && command -v ffmpeg && \
-  for v in WIKI_PATH GOOGLE_APPLICATION_CREDENTIALS AUDIO_DRIVE_FOLDER_ID CRAIG_GROQ_API_KEY GITHUB_TOKEN; do \
+  for v in WIKI_PATH GOOGLE_APPLICATION_CREDENTIALS AUDIO_DRIVE_FOLDER_ID CRAIG_GROQ_API_KEY; do \
     [ -n "${!v}" ] || { echo "missing $v"; exit 1; }; \
   done && echo "ok"
 ```
@@ -111,10 +111,10 @@ Exit codes : `0` pour `processed` ou `skipped`, `1` pour `error` runtime, `2` po
 
 ```bash
 cd "$WIKI_PATH"
-git pull --rebase
+/usr/local/bin/hermes-wiki-git pull
 git add "<path renvoyé par scan.py>"
 git commit -m "raw: capture transcript $(basename '<path>' .md)"
-git push
+/usr/local/bin/hermes-wiki-git push
 ```
 
 Si le push échoue avec une erreur d'auth, attends 60 s (le sidecar refresh le token toutes les 45 min) et retry une fois. Au-delà, log et stoppe — le raw est commité localement, le push se rattrape au run suivant.
@@ -154,7 +154,7 @@ Quand tout est OK :
 - **Audio > 25 MB** : géré automatiquement par découpe ffmpeg en chunks ~20 MB, transcription par chunk, puis fusion des segments avec offset temporel. Aucune action côté agent — surveiller juste les progress events `groq-split` / `groq-chunk` (utiles pour un message de statut Discord live).
 - **SA sans accès au dossier** : `files.list` renvoie une liste vide (pas une erreur de permission). Le script va donc poll 20 min puis renvoyer `drive-poll-timeout`. Si ça arrive systématiquement, vérifier que `AUDIO_DRIVE_FOLDER_ID` est partagé avec l'email du SA.
 - **Pas de filtrage par channel/instance** : V3 ne fait AUCUNE décision de routing. Le routing est garanti par les permissions Discord (chaque instance ne voit que son `#craig-events`). Si tu reçois un recording ID, il est pour toi.
-- **Pas de `git remote set-url` avec token, ni `export GITHUB_TOKEN=...`** : le credential helper infra fait le boulot. Ces commandes déclenchent le scanner de sécurité Hermes inutilement.
+- **Pas de `git remote set-url`, `git credential fill`, ni `export GITHUB_TOKEN=...`** : utilise uniquement `/usr/local/bin/hermes-wiki-git pull|push` pour le réseau.
 - **Pas de `pip install`** : indispo dans l'image upstream. Toujours `uv run --with <pkg>`.
 - **Pas d'écriture de fichiers dans `/opt/data/`, `/opt/hermes/`** : le script utilise `tempfile.TemporaryDirectory()`.
 

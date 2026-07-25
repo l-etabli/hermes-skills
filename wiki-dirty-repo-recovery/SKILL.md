@@ -95,7 +95,7 @@ git commit -m "reconcile: post-stash-pop merge"
 ```bash
 git status --short      # doit être vide
 git log --oneline -5    # doit montrer le commit du WIP + le commit de l'ingest + le merge
-git push                # si commits non pushés
+/usr/local/bin/hermes-wiki-git push  # si commits non pushés
 ```
 
 ## Pitfalls
@@ -120,4 +120,4 @@ L'inverse — stash → ingest → pop avec conflicts — coûte plus cher dès 
 - `git status --short` retourne vide.
 - `git log --oneline -10` montre une chronologie cohérente : WIP committé OU ingest committé + reconciliation au-dessus.
 - Aucune entrée dans `git stash list`.
-- `git push` est passé sans `non-fast-forward`.
+- `/usr/local/bin/hermes-wiki-git push` est passé sans `non-fast-forward`.

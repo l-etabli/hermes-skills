@@ -144,11 +144,11 @@ Une fois le texte extrait, applique les **6 etapes du playbook `llm-wiki` ingest
 ③ **Check existing** : `search_files` dans `$WIKI_PATH/index.md` + grep pour les entites/concepts mentionnes (ex: « Peloton », « HGE », « Wellview ») — eviter les doublons.
 ④ **Write/update** pages `entities/` et `concepts/` selon les seuils de `SCHEMA.md` (≥ 2 mentions ou central a la source). Frontmatter complet, wikilinks (≥ 2 sortants par page), tags depuis la taxonomie SCHEMA, provenance `^[raw/papers/<file>.md]` quand 3+ sources.
 ⑤ **Update navigation** : ajouter les nouvelles pages a `index.md` + appender a `log.md` (`## [YYYY-MM-DD] ingest | <Source Title>` avec liste des fichiers crees/modifies).
-⑥ **Commit + push** depuis `$WIKI_PATH`. Le token est dans `$GITHUB_TOKEN` (refresh sidecar 45m).
+⑥ **Commit + push** depuis `$WIKI_PATH`. Pour le réseau, utilise `/usr/local/bin/hermes-wiki-git pull|push` ; le wrapper lit le token rafraîchi sans l’exposer au sandbox.
 
 - **Staging selectif, pas `git add .`** : ne stage QUE les fichiers que tu as crees/modifies pour cet ingest (raw, entities/concepts touches, `index.md`, `log.md`). Cf. etape 3 — si le repo etait dirty avec du state non lie, `git add .` polluerait ton commit avec ce state.
 - **Verification remote avant push** : si le repo a recemment montre des sync issues (push qui foire, ou tu vois l'instance pour la premiere fois apres une migration), un `git remote -v` rapide te dit sur quoi tu pousses. Skip si l'instance push normalement depuis des semaines.
-- `git commit -m "ingest: <source>"` puis `git push`.
+- `git commit -m "ingest: <source>"` puis `/usr/local/bin/hermes-wiki-git push`.
 - **Si `git push` echoue** : ne perds pas l'ingest. Surface a l'utilisateur le commit hash local (`git rev-parse HEAD`) et l'URL remote (`git remote get-url origin`) pour qu'il puisse fixer l'auth/wiring du repo. L'ingest est commite localement, il sera pushe au prochain push reussi.
 
 Pour chaque etape, utilise tes tools natifs (`terminal` pour les ecritures fs et git, `search_files` pour la recherche) — **pas** de subagent / `delegate_task`. Le subagent rallonge le temps et casse la traçabilite Discord (l'utilisateur ne voit plus ce que tu fais).

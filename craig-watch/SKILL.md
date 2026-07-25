@@ -126,10 +126,10 @@ Entre le moment où Craig pose `Recording ended.` et la notif finale ✅, il s'�
 
 ```bash
 cd "$WIKI_PATH"
-git pull --rebase
+/usr/local/bin/hermes-wiki-git pull
 git add "<path>"
 git commit -m "raw: capture transcript $(basename '<path>' .md)"
-git push
+/usr/local/bin/hermes-wiki-git push
 ```
 
 Puis active le skill `llm-wiki` et applique son opération `ingest` sur le fichier (en automated mode, sans validation utilisateur).
