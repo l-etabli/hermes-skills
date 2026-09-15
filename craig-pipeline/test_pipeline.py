@@ -360,3 +360,34 @@ def test_process_lock_makes_concurrent_run_a_silent_success(
     payload = json.loads(capsys.readouterr().out)
     assert returncode == 0
     assert payload["status"] == "already-running"
+
+
+def test_completed_recording_keeps_a_terminal_marker(monkeypatch, tmp_path):
+    pipeline = _load_pipeline(monkeypatch, tmp_path)
+    path = tmp_path / '.craig-pending/done.json'
+    pending = pipeline.migrate_pending({'craig_id': 'done', 'first_seen_at': datetime.now(timezone.utc).isoformat()})
+    pending['stages']['debrief_post'] = {'status': 'completed'}
+    pipeline.save_pending(path, pending)
+    assert pipeline.process_pending(path)['status'] == 'done'
+    assert not path.exists()
+    completed = json.loads((tmp_path / '.craig-pending/completed/done.json').read_text())
+    assert completed['stages']['debrief_post']['status'] == 'completed'
+
+
+def test_stuck_recording_is_quarantined_after_three_deadlines(monkeypatch, tmp_path, capsys):
+    import time
+    pipeline = _load_pipeline(monkeypatch, tmp_path)
+    path = tmp_path / '.craig-pending/stuck.json'
+    pipeline.save_pending(path, {'craig_id': 'stuck', 'first_seen_at': datetime.now(timezone.utc).isoformat()})
+    monkeypatch.setattr(pipeline, 'RECORDING_TIMEOUT_S', 0.1, raising=False)
+    monkeypatch.setattr(pipeline, 'process_pending', lambda _path: time.sleep(0.5))
+    monkeypatch.setattr(pipeline, 'maybe_self_delete_cron', lambda: {'status': 'skipped'})
+    monkeypatch.setattr(pipeline, 'discord_post', lambda *a, **kw: ('message', None))
+    monkeypatch.setattr(sys, 'argv', ['pipeline.py'])
+    for expected_code in (1, 1, 2):
+        assert pipeline.main() == expected_code
+        result = json.loads(capsys.readouterr().out)
+        assert result['status'] == 'error'
+    assert not path.exists()
+    failed = json.loads((tmp_path / '.craig-failed/stuck.json').read_text())
+    assert failed['failures']['consecutive'] == 3

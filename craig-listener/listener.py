@@ -7,48 +7,11 @@
 #   "requests",
 # ]
 # ///
-"""
-craig-listener: react to a Craig recording-panel message in #craig-events.
+"""Fetch Craig's latest panel and enqueue it for the bounded pipeline.
 
-The Craig panel goes through two states (in the SAME Discord message,
-edited in place — Craig does not post a separate "ended" message):
-
-  initial:  "🔴 Recording...        Recording ID: <id>"
-  ended:    "Recording ended.       Recording ID: <id>"
-
-Hermes upstream does not support `on_message_edit`, so this listener
-only sees the INITIAL state. To bridge the gap, the listener:
-
-  1. Extracts the Recording ID from the message body.
-  2. If the body already shows "Recording ended." (rare: panel was
-     missed live and Hermes only sees it after the fact), invokes
-     craig-transcript-record/scan.py directly.
-  3. Otherwise, writes a pending-state file to
-     $WIKI_PATH/.craig-pending/<craig_id>.json containing
-     craig_id, channel_id, message_id, first_seen_at. The cron-based
-     craig-watch skill picks it up from there, refetches the message
-     periodically, and triggers the transcription when it sees
-     "Recording ended.".
-
-No routing decisions: Discord category permissions guarantee that if
-this instance can read a Craig message, the recording is its own.
-
-Input (one of):
-  --message "<raw text>"        --message-file <path>        (else: stdin)
-Plus REQUIRED for pending state:
-  --channel-id <discord channel id>
-  --message-id <discord message id>
-
-Output (single JSON object on stdout):
-  {"status": "pending",        "craig_id": "...", "state_path": ".craig-pending/<id>.json"}
-  {"status": "already-pending", "craig_id": "...", "state_path": ".craig-pending/<id>.json"}
-  {"status": "processed", "craig_id": "...", "path": "...", "progress": [...], ...}  # passed-through from scan.py
-  {"status": "skipped",   "craig_id": "...", "reason": "...", "progress": [...]?, ...}
-  {"status": "error",     "craig_id": "...", "reason": "...", "detail": "...", "progress": [...]?}
-  {"status": "error",     "reason": "no-recording-id|empty-message|...", "detail": "..."}
-
-Exit codes: 0 for pending/processed/skipped, 1 for runtime errors,
-2 for argument errors.
+No arguments: the script discovers the panel via Discord REST, including
+Components V2. Both live and ended recordings use the same pending/cron path.
+Completed or quarantined recordings are never automatically requeued.
 """
 from __future__ import annotations
 
@@ -72,11 +35,6 @@ if _missing:
 WIKI_PATH = pathlib.Path(os.environ["WIKI_PATH"])
 PENDING_DIR = WIKI_PATH / ".craig-pending"
 
-SKILLS_ROOT = pathlib.Path(
-    os.environ.get("HERMES_SKILLS_DIR", "/opt/data/skills-shared")
-)
-SCAN_PY = SKILLS_ROOT / "craig-transcript-record" / "scan.py"
-
 RECORDING_ID_RE = re.compile(
     # Craig in Components V2 writes `**Recording ID:** \`<id>\``, so we
     # have to skip past stray markdown wrappers (** for bold, backticks
@@ -85,7 +43,6 @@ RECORDING_ID_RE = re.compile(
     r"Recording[\s*]*ID[\s*]*:[\s*`]*([A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
-ENDED_RE = re.compile(r"Recording\s+ended\.", re.IGNORECASE)
 
 DISCORD_API = "https://discord.com/api/v10"
 
@@ -215,41 +172,6 @@ def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def invoke_scan(craig_id: str) -> tuple[int, dict, list[dict]]:
-    """Run scan.py and parse its multi-line JSON stdout. Returns
-    (returncode, canonical_result, progress_entries) — the progress
-    list mirrors what scan.py emitted in order, so the LLM can replay
-    the phases on a Discord status message."""
-    if not SCAN_PY.exists():
-        return 1, {"status": "error", "reason": "scan-py-missing",
-                   "detail": f"{SCAN_PY} not found (HERMES_SKILLS_DIR misconfigured?)"}, []
-    cmd = [
-        "uv", "run",
-        "--with", "google-auth",
-        "--with", "google-api-python-client",
-        "--with", "requests",
-        str(SCAN_PY),
-        "--craig-id", craig_id,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
-    progress: list[dict] = []
-    result: dict | None = None
-    for ln in lines:
-        try:
-            obj = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("status") == "progress":
-            progress.append(obj)
-        else:
-            result = obj
-    if result is None:
-        return 1, {"status": "error", "reason": "scan-py-bad-json",
-                   "detail": (proc.stdout + proc.stderr)[-500:]}, progress
-    return proc.returncode, result, progress
-
-
 FOLLOWUP_CRON_NAME = "craig-watch-followup"
 FOLLOWUP_CRON_SCRIPT = "craig-pipeline-runner.sh"
 
@@ -316,16 +238,26 @@ def write_pending(craig_id: str, channel_id: str, message_id: str) -> tuple[path
     (listener fired twice on the same recording — duplicate Discord event)."""
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     path = PENDING_DIR / f"{craig_id}.json"
-    if path.exists():
-        return path, False
     payload = {
         "craig_id": craig_id,
         "channel_id": channel_id,
         "message_id": message_id,
         "first_seen_at": datetime.now(timezone.utc).isoformat(),
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except FileExistsError:
+        return path, False
     return path, True
+
+
+def terminal_reason(craig_id: str) -> str | None:
+    for folder, reason in ((".craig-failed", "quarantined"),
+                           (".craig-pending/completed", "already-completed")):
+        if (WIKI_PATH / folder / f"{craig_id}.json").exists():
+            return reason
+    return None
 
 
 def main() -> int:
@@ -368,16 +300,17 @@ def main() -> int:
     channel_id = os.environ["CRAIG_EVENTS_CHANNEL_ID"]
     message_id = str(panel["id"])
 
-    if ENDED_RE.search(message):
-        # Already ended: skip the pending dance, transcribe now.
-        rc, payload, progress = invoke_scan(craig_id)
-        payload["craig_id"] = craig_id
-        if progress:
-            payload["progress"] = progress
-        emit(payload)
-        return rc
-
+    reason = terminal_reason(craig_id)
+    if reason:
+        emit({"status": "skipped", "craig_id": craig_id, "reason": reason})
+        return 0
     state_path, is_new = write_pending(craig_id, channel_id, message_id)
+    # Completion may have moved the old pending between our check and create.
+    reason = terminal_reason(craig_id)
+    if reason:
+        state_path.unlink(missing_ok=True)
+        emit({"status": "skipped", "craig_id": craig_id, "reason": reason})
+        return 0
     emit({
         "status": "pending" if is_new else "already-pending",
         "craig_id": craig_id,

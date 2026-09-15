@@ -90,3 +90,44 @@ def test_paused_followup_cron_is_not_recreated_or_resumed(monkeypatch, tmp_path)
     assert calls == [[
         "/opt/hermes/.venv/bin/hermes", "cron", "list", "--all"
     ]]
+
+
+def test_ended_panel_is_queued_once_without_inline_transcription(monkeypatch, tmp_path, capsys):
+    import json
+    import sys
+    listener = _load_listener(monkeypatch, tmp_path)
+    panel = {'id': '456', 'content': '', 'embeds': [], 'components': [
+        {'type': 17, 'components': [
+            {'type': 10, 'content': 'Recording ended.\n**Recording ID:** `recording`'},
+        ]},
+    ]}
+    monkeypatch.setattr(listener, 'find_latest_craig_panel', lambda: (panel, None))
+    monkeypatch.setattr(listener, 'ensure_followup_cron', lambda: 'already-running')
+    monkeypatch.setattr(sys, 'argv', ['listener.py'])
+    monkeypatch.setattr(listener.subprocess, 'run', lambda *a, **kw: (_ for _ in ()).throw(AssertionError('no inline scan')))
+    assert listener.main() == 0
+    first = json.loads(capsys.readouterr().out)
+    state = (tmp_path / '.craig-pending/recording.json').read_text()
+    assert first['status'] == 'pending'
+    assert listener.main() == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'already-pending'
+    assert (tmp_path / '.craig-pending/recording.json').read_text() == state
+
+
+def test_terminal_recordings_are_not_requeued(monkeypatch, tmp_path, capsys):
+    import json
+    import sys
+    listener = _load_listener(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, 'argv', ['listener.py'])
+    monkeypatch.setattr(listener, 'find_latest_craig_panel', lambda: ({
+        'id': '456', 'content': 'Recording ended. Recording ID: recording',
+    }, None))
+    monkeypatch.setattr(listener, 'ensure_followup_cron', lambda: (_ for _ in ()).throw(AssertionError('no cron')))
+    for folder, reason in [('.craig-pending/completed', 'already-completed'), ('.craig-failed', 'quarantined')]:
+        marker = tmp_path / folder / 'recording.json'
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{}')
+        assert listener.main() == 0
+        assert json.loads(capsys.readouterr().out)['reason'] == reason
+        assert not (tmp_path / '.craig-pending/recording.json').exists()
+        marker.unlink()

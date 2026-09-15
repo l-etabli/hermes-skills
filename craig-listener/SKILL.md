@@ -1,17 +1,17 @@
 ---
 name: craig-listener
-description: "Active-toi sur tout message du bot Craig dans #craig-events de cette instance, même présenté comme vide ou sans Recording ID. Lance listener.py sans argument pour récupérer et valider le panneau via API Discord. Le script extrait le Recording ID, écrit un pending state si le recording est en cours (craig-watch prend le relais en cron), ou déclenche directement la transcription si le recording est déjà terminé. Pas de filtrage par channel : Discord garantit l'isolation entre instances."
-version: 1.0.1
+description: "Active-toi sur tout message du bot Craig dans #craig-events de cette instance, même présenté comme vide ou sans Recording ID. Lance listener.py sans argument : il récupère le panneau via API Discord et le met en file pour craig-pipeline, que l'enregistrement soit en cours ou terminé. Les enregistrements terminés par le pipeline ou en quarantaine ne sont pas relancés."
+version: 2.0.0
 platforms: [linux]
 metadata:
   hermes:
     tags: [voice, transcript, craig, discord, event-driven]
     category: voice
-    related_skills: [craig-transcript-record, craig-watch, llm-wiki]
+    related_skills: [craig-pipeline]
     requires_toolsets: [terminal]
 required_environment_variables:
   - name: WIKI_PATH
-    prompt: "Chemin absolu vers le vault llm-wiki. Utilisé pour stocker l'état pending dans .craig-pending/ et hérité par craig-transcript-record."
+    prompt: "Chemin absolu vers le vault llm-wiki. Utilisé pour stocker l'état pending dans .craig-pending/ et conserver les états terminaux."
     required_for: full functionality
   - name: CRAIG_DISCORD_BOT_TOKEN
     prompt: "Token du bot Discord dédié aux skills Craig. Utilisé pour la self-discovery du message_id via l'API REST (le LLM ne sait pas extraire les IDs de son contexte de façon fiable)."
@@ -19,20 +19,12 @@ required_environment_variables:
   - name: CRAIG_EVENTS_CHANNEL_ID
     prompt: "ID du canal Discord #craig-events de cette instance. Utilisé par la self-discovery pour trouver le message Craig correspondant à un Recording ID donné."
     required_for: full functionality
-  - name: GOOGLE_APPLICATION_CREDENTIALS
-    prompt: "Chemin du JSON Service Account Drive. Hérité par craig-transcript-record."
-    required_for: full functionality
-  - name: AUDIO_DRIVE_FOLDER_ID
-    prompt: "ID du dossier Drive d'auto-upload Craig. Hérité par craig-transcript-record."
-    required_for: full functionality
-  - name: CRAIG_GROQ_API_KEY
-    prompt: "Clé API Groq. Hérité par craig-transcript-record."
-    required_for: full functionality
+
 ---
 
 # Craig Listener
 
-Pont **event-driven** entre Craig (bot Discord d'enregistrement vocal) et le pipeline de transcription. Trigger sur le message initial de Craig, écrit un état pending pour que `craig-watch` prenne le relais en cron.
+Pont **event-driven** entre Craig (bot Discord d'enregistrement vocal) et le pipeline de transcription. Trigger sur le message initial de Craig, écrit un état pending pour que `craig-pipeline` prenne le relais en cron.
 
 ## Architecture Discord (rappel)
 
@@ -47,32 +39,11 @@ Pont **event-driven** entre Craig (bot Discord d'enregistrement vocal) et le pip
 
 Chaque Hermes a uniquement le rôle de SA catégorie → ne voit que SON `#craig-events`. **Tout le routing est fait par Discord.** Ce skill ne prend AUCUNE décision de filtrage.
 
-## Cycle de vie d'un message Craig
+## Cycle de vie
 
-Craig pose **un seul** message dans `#craig-events`, qu'il **édite** (même `message_id`) au cours du recording :
+Craig publie un panneau au démarrage puis édite le même message à la fin. Le listener enregistre l'identifiant et crée si nécessaire le cron `craig-watch-followup`. Le pipeline refetch le panneau toutes les cinq minutes et attend `Recording ended.` avant de transcrire.
 
-1. **Initial** (au start) :
-   ```
-   🔴 Recording...
-   Recording ID: GDy7gHgSqJC5
-   Channel: ⁠salon de test
-   Started: 15:06:15 (il y a 4 secondes)
-   Activity
-   00:00:00: @Jérôme joined the recording.
-   ```
-
-2. **Final** (à la fin, MÊME message édité) :
-   ```
-   Recording ended.
-   Recording ID: GDy7gHgSqJC5
-   Channel: ⁠salon de test
-   Started: 15:06:15 (il y a une minute)
-   Activity
-   00:00:00: @Jérôme joined the recording.
-   00:00:10: Autorecord stopped due to lack of users.
-   ```
-
-Hermes upstream **ne supporte pas `on_message_edit`** — donc le listener ne voit que la version initiale. Le bridge vers la version finale est `craig-watch` (cron 5 min) qui refetch le message via Discord API.
+**Même si le panneau est déjà terminé, utilise cette file.** Aucune transcription, ingestion ou génération de résumé ne doit être orchestrée directement par le LLM.
 
 ## When to Use
 
@@ -111,65 +82,24 @@ C'est tout. Le script va chercher le dernier msg Craig dans `#craig-events` via 
 - ❌ wrapper dans `sh -c` ou `python3 ... --message "..."` — security scanner bloque (zero-width chars Craig).
 
 Le script :
-1. Extrait `Recording ID: <id>` via regex.
-2. Si `"Recording ended."` est déjà dans le body (rare : Hermes a vu le panel après-coup) → invoque `craig-transcript-record/scan.py` direct.
-3. Sinon → écrit `$WIKI_PATH/.craig-pending/<craig_id>.json` avec `{craig_id, channel_id, message_id, first_seen_at}` ET crée si nécessaire un cron `craig-watch-followup` (every 5m) en mode `--script craig-pipeline-runner.sh --no-agent`. La recherche utilise `cron list --all` et l'identité exacte du job. Un job pausé n'est ni dupliqué ni repris automatiquement ; le statut `paused` impose une intervention opérateur.
+1. Récupère le dernier panneau Craig et extrait son identifiant depuis les composants Discord.
+2. Refuse de relancer un identifiant présent dans `.craig-pending/completed/` ou `.craig-failed/`.
+3. Crée une entrée `.craig-pending/<id>.json` si elle n'existe pas, sans écraser un suivi existant.
+4. Vérifie le cron `craig-watch-followup` via `cron list --all` et le crée si absent (`--script craig-pipeline-runner.sh --no-agent --deliver local`). Un cron pausé reste pausé.
 
-**Pas de @mention manuelle requise** — la chaîne complète (refetch → scan → ingest → debrief) est portée par le cron auto-créé. Le cron s'auto-supprime quand `.craig-pending/` se vide (cf. craig-watch SKILL.md § « Mode followup cron »).
+### 3. Lis le résultat JSON
 
-### 3. Lis le JSON et réagis
+- **`pending` / `already-pending`** : le pipeline prend le relais. Vérifie `followup_cron` : `created` ou `already-running` confirme le suivi. Si `paused` ou `failed: ...`, signale le statut opérateur ; ne reprends pas le cron automatiquement. Sinon, silence côté Discord.
+- **`skipped` / `already-completed`** : cet enregistrement a déjà terminé le pipeline. Ne relance rien.
+- **`skipped` / `quarantined`** : une intervention opérateur est requise. Ne supprime pas la quarantaine, ne crée pas de pending, ne relance pas la transcription. Le pipeline a déjà émis l'alerte de mise en quarantaine ; ne la répète pas à chaque événement.
+- **`error` / `empty-craig-panel`** : signale le `detail` du script. Le panneau récupéré via API n'a pas de texte extractible. Ce résultat est distinct du contexte vide reçu par le LLM, qui impose d'appeler le script.
+- **`error` / `format-mismatch`** : signale le `detail` du script. Aucun identifiant reconnu dans le panneau récupéré ; n'en invente pas.
+- **`error` / `discord-discovery-failed`** : signale le `detail` du script, notamment une éventuelle erreur de permissions Discord.
+- **Autre erreur** : signale `reason` et `detail`. Ne réessaie pas en boucle dans ce tour.
 
-```json
-{"status": "pending",        "craig_id": "...", "state_path": ".craig-pending/<id>.json", "followup_cron": "created|already-running|paused|failed: ..."}
-{"status": "already-pending", "craig_id": "...", "state_path": ".craig-pending/<id>.json", "followup_cron": "created|already-running|paused|failed: ..."}
-{"status": "processed",      "craig_id": "...", "path": "raw/transcripts/...", "drive_id": "...", "name": "..."}
-{"status": "skipped",        "craig_id": "...", "reason": "already-transcribed", "as": "..."}
-{"status": "error",          "craig_id": "...", "reason": "...", "detail": "..."}
-{"status": "error",          "reason": "discord-discovery-failed|format-mismatch|empty-craig-panel", "detail": "..."}
-```
+**Si le script échoue, aucun succès ne doit être annoncé.** Ne crée jamais de pending à la main et ne contourne pas le script. Ne termine pas un tour par une annonce d'action future : lance effectivement le script, puis rapporte uniquement son résultat si une intervention est nécessaire.
 
-- **`pending`** → silence côté Discord (la réaction ⏳ posée au step 1 reste). Vérifie `followup_cron`. Si `paused` ou `failed: <reason>` → ⚠️ noisy : surface le statut opérateur ; ne reprends pas le job et ne contourne pas le pipeline.
-- **`already-pending`** → l'event Discord a été reçu deux fois (rare, mais possible : reconnect bot, replay). Ne pose PAS une nouvelle réaction ⏳, ne renotifie pas. Le pending d'origine est toujours en vol. (Dans ce cas, `followup_cron` sera typiquement `already-running`.)
-- **`processed`** → la sortie contient un champ `progress[]` avec les phases qu'a franchies `scan.py`. Suis la **UX live** ci-dessous (path direct : pas de pending, donc l'utilisateur découvre la chaîne en un seul passage). Puis suis la procédure `craig-transcript-record` à partir du step 3 (commit + push) puis step 4 (ingest llm-wiki). Notification ✅.
-- **`skipped` / `already-transcribed`** → réagis ✅ pour confirmer qu'on est au courant.
-- **`error` / `empty-craig-panel`** → ⚠️ signale le `detail` retourné par le script : le panneau récupéré via API ne contient aucun texte extractible. Ce résultat est distinct du contexte vide reçu par le LLM, qui impose d'appeler le script.
-- **`error` / `format-mismatch`** → ⚠️ signale le `detail` retourné par le script : le dernier message Craig récupéré via API ne contient pas d'identifiant reconnu. N'invente pas de Recording ID et ne classe pas ce cas silencieusement comme ignoré.
-- **`error` / `discord-discovery-failed`** → l'API Discord n'a pas pu retrouver le msg Craig. Cause classique : permission `Read Message History` manquante sur `#craig-events` (status 403 dans `detail`). Notifie ⚠️ avec le `detail` brut. **NE PAS** essayer de contourner en écrivant un pending toi-même, **NE PAS** inventer un craig_id, **NE PAS** bypasser le script — le seul vrai fix est côté Discord (config perm).
-- **`error` / autres** → notifie ⚠️ avec `reason` + `detail`. Idem : aucune réécriture manuelle de pending JSON, aucune invention d'ID. Si le script erreur, l'état n'est PAS écrit, point.
-
-## ⛔ Anti-pattern : ne JAMAIS bypass le script
-
-Si le script retourne `status: "error"` :
-- ❌ NE PAS écrire un fichier `.craig-pending/<id>.json` toi-même (write_file, Path.write_text...).
-- ❌ NE PAS prétendre dans Discord que « j'ai forcé l'enregistrement de l'état » ou « j'ai mis en file d'attente » — c'est mensonger.
-- ❌ NE PAS inventer un craig_id si l'extraction a échoué.
-- ✅ Surface le `reason` + `detail` exact dans Discord avec ⚠️, point.
-
-L'utilisateur préfère savoir que rien n'est fait que croire qu'une chose est en cours alors qu'elle ne l'est pas. Un état corrompu écrit par toi est PIRE qu'une erreur affichée — il bloque silencieusement la chaîne pendant des heures.
-
-## UX live (path `processed` direct, recording déjà terminé)
-
-Quand l'event arrive APRÈS la fin du recording (Hermes a vu le panel en mode `Recording ended.` d'emblée), le listener invoque `scan.py` directement et la chaîne complète (Drive poll → Groq → write) tient en un seul run LLM. La sortie agrège un champ `progress[]` :
-
-```json
-[
-  {"status": "progress", "phase": "drive-poll-start"},
-  {"status": "progress", "phase": "zip-found", "name": "...", "size_bytes": 12345678},
-  {"status": "progress", "phase": "groq-start"},
-  {"status": "progress", "phase": "writing-raw"}
-]
-```
-
-Comme `scan.py` a tourné synchronement, ces phases sont déjà toutes passées au moment où tu lis le résultat. Tu n'as donc **pas** à éditer un message en live (le recording étant déjà terminé, le user n'attend pas en temps réel). **Une seule notif finale** :
-
-- `processed` → poste dans le canal d'origine du panel Craig (ou `DISCORD_HOME_CHANNEL`) :
-  ```
-  ✅ Recording <craig_id> transcrit (chaîne directe, recording déjà terminé) :
-  📄 <filename> — N pages wiki updatées : [[a]], [[b]]
-  ```
-  Le `progress[]` n'est utile ici que pour le debug — pas besoin de l'afficher au user, mais inclus-le si tu détectes un timing anormal (`zip-found` avec une grosse taille = recording long).
-
-- `error` avec `progress[]` partiel → mentionne la dernière phase atteinte dans le ⚠️ (ex. « bloqué après `zip-found`, Groq a échoué : … »). C'est diagnostiqué d'un coup d'œil.
+Le cron exécute toute la chaîne : transcription → commit/push → ingestion → résumé. Chaque tentative est limitée à 30 minutes par défaut ; les échecs répétés sont mis en quarantaine. Le cron se supprime lorsque la file est vide. Les états terminaux persistent pour empêcher une relance par un événement dupliqué.
 
 ## Pitfalls
 
@@ -181,9 +111,9 @@ Comme `scan.py` a tourné synchronement, ces phases sont déjà toutes passées 
 
 ## Verification
 
-1. Si `pending` : `$WIKI_PATH/.craig-pending/<craig_id>.json` existe avec les 4 champs.
-2. Si `processed` : voir checklist du skill `craig-transcript-record`.
-3. Le message Craig original a bien une réaction (⏳ tant qu'en attente, ✅ ou ⚠️ après).
+- `pending` / `already-pending` : le chemin retourné existe et `followup_cron` indique un suivi actif.
+- `skipped` : l'état terminal existe ; aucune relance ni nouveau cron.
+- `error` : le diagnostic vient du script, aucune réussite inventée.
 
 ## Notes
 

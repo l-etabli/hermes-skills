@@ -113,7 +113,7 @@ Famille **Craig** — capture event-driven des recordings vocaux Discord (Craig 
 
 | Skill | Catégorie | Trigger | Rôle |
 |---|---|---|---|
-| [`craig-listener`](./craig-listener/) | voice | Discord event | Capte le msg initial de Craig dans `#craig-events`, extrait le Recording ID, écrit un pending state dans `$WIKI_PATH/.craig-pending/` (le watcher prend le relais). Si le msg montre déjà `Recording ended.`, déclenche directement la transcription. |
+| [`craig-listener`](./craig-listener/) | voice | Discord event | Capte le msg initial de Craig dans `#craig-events`, extrait le Recording ID, écrit un pending state dans `$WIKI_PATH/.craig-pending/` (le watcher prend le relais). Les panneaux déjà terminés passent aussi par le pipeline borné ; les doublons terminés ou en quarantaine ne sont pas relancés. |
 | [`craig-watch`](./craig-watch/) | voice | Cron 5 min | Refetch chaque pending via l'API Discord, détecte la transition vers `Recording ended.`, invoque `craig-transcript-record/scan.py`, supprime le pending sur succès. Expire les pending > 24h. |
 | [`craig-scan`](./craig-scan/) | voice | Manuel (utilisateur) | Liste les recordings finis dans l'historique de `#craig-events` qui n'ont jamais été transcrits ni watchés, présente la liste, **attend la sélection utilisateur**, puis transcrit séquentiellement les IDs validés. |
 | [`craig-transcript-record`](./craig-transcript-record/) | voice | `--craig-id <ID>` (appelé par les 3 ci-dessus) | Primitive de transcription : poll Drive (30→60→120s, timeout 20 min), download le zip Craig, mix ffmpeg multi-pistes, Groq Whisper, écrit `raw/transcripts/<date>-craig-<id>-…md`. Idempotent via `drive_id` + `craig_id`. |

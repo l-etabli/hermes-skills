@@ -78,6 +78,7 @@ from datetime import datetime, timezone
 import requests
 import yaml
 from jsonschema import Draft202012Validator
+from deadline import run_with_deadline
 from ingest_plan import (
     RETRY_ECHO_BYTES,
     apply_edit,
@@ -131,6 +132,7 @@ LLM_WIKI_SKILL_PATH = pathlib.Path(
 )
 
 PIPELINE_LLM_TIMEOUT_S = int(os.environ.get("PIPELINE_LLM_TIMEOUT_S", "300"))
+RECORDING_TIMEOUT_S = float(os.environ.get("CRAIG_PIPELINE_RECORDING_TIMEOUT_S", "1800"))
 MIN_DURATION_S = int(os.environ.get("MEETING_DEBRIEF_MIN_DURATION_S", "180"))
 MAX_AGE_HOURS = float(os.environ.get("CRAIG_PIPELINE_MAX_AGE_HOURS", "6"))
 
@@ -377,11 +379,11 @@ def save_pending(path: pathlib.Path, data: dict) -> None:
     os.replace(temporary, path)
 
 
-def delete_pending(path: pathlib.Path) -> None:
-    try:
-        path.unlink()
-    except OSError:
-        pass
+def complete_pending(path: pathlib.Path) -> None:
+    """Retain the successful checkpoint so duplicate events cannot restart it."""
+    completed_dir = WIKI_PATH / ".craig-pending/completed"
+    completed_dir.mkdir(parents=True, exist_ok=True)
+    os.replace(path, completed_dir / path.name)
 
 
 STAGE_NAMES = (
@@ -1580,7 +1582,7 @@ def process_pending(pending_path: pathlib.Path) -> dict:
         )
 
     if _completed(pending["stages"].get("debrief_post")):
-        delete_pending(pending_path)
+        complete_pending(pending_path)
         return {"craig_id": craig_id, "status": "done", "phase": "done"}
 
     if panel_id:
@@ -1766,7 +1768,7 @@ def process_pending(pending_path: pathlib.Path) -> dict:
     if duration_s and duration_s < MIN_DURATION_S:
         post_phase("done", f"Recording court ({duration_s}s < {MIN_DURATION_S}s) — "
                            f"pas de debrief généré.")
-        delete_pending(pending_path)
+        complete_pending(pending_path)
         summary.update({"status": "done-short", "phase": "done-short"})
         return summary
 
@@ -1854,7 +1856,7 @@ def process_pending(pending_path: pathlib.Path) -> dict:
     )
     save_pending(pending_path, pending)
     post_phase("done", "Pipeline terminé.")
-    delete_pending(pending_path)
+    complete_pending(pending_path)
     summary.update({"status": "done", "phase": "done"})
     return summary
 
@@ -1905,7 +1907,9 @@ def main() -> int:
     out_summaries: list[dict] = []
     for p in pendings:
         try:
-            out_summaries.append(process_pending(p))
+            out_summaries.append(run_with_deadline(
+                process_pending, p, timeout_s=RECORDING_TIMEOUT_S,
+            ))
         except Exception as exc:
             try:
                 pending = migrate_pending(load_pending(p))

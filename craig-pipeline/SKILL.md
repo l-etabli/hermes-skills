@@ -1,7 +1,7 @@
 ---
 name: craig-pipeline
 description: "Orchestrateur déterministe Python qui pilote toute la chaîne post-Craig avec checkpoints SHA-256, circuit breaker et quarantaine. Ingest et debrief passent par `hermes -z`; le cron lance directement le runner no-agent."
-version: 2.0.0
+version: 2.1.0
 platforms: [linux]
 metadata:
   hermes:
@@ -33,6 +33,9 @@ required_environment_variables:
     required_for: full functionality
   - name: MEETING_DEBRIEF_MIN_DURATION_S
     prompt: "Durée min d'un recording pour mériter un debrief (défaut 180). Sous le seuil : pipeline post le ✅ final 'recording court' et supprime le pending sans appel LLM debrief."
+    required_for: optional
+  - name: CRAIG_PIPELINE_RECORDING_TIMEOUT_S
+    prompt: "Durée maximale d'une tentative par enregistrement (défaut 1800 secondes). À l'expiration, le superviseur arrête le worker et ses sous-processus puis comptabilise l'échec."
     required_for: optional
   - name: CRAIG_PIPELINE_MAX_AGE_HOURS
     prompt: "Durée de vie absolue d'un pending avant quarantaine (défaut 6 heures)."
@@ -66,6 +69,14 @@ Le cron est un job upstream **sans agent**. Il exécute directement :
 Le runner garde le succès silencieux, journalise localement une sortie bornée
 et propage tout code non nul au scheduler. Aucun LLM n'orchestre ou ne
 « rattrape » une phase.
+
+## Arrêt des tentatives et événements dupliqués
+
+Tous les panneaux, même déjà terminés, passent par `.craig-pending/`. Chaque enregistrement est traité dans un worker Linux séparé, sous le verrou du superviseur. La tentative entière (Drive, transcription, Git, ingestion, debrief) dispose de 30 minutes par défaut ; à l'expiration, le groupe de processus du worker est arrêté et l'échec est comptabilisé. Trois échecs identiques entraînent une quarantaine ; l'expiration de six heures reste applicable.
+
+Un succès déplace le suivi vers `.craig-pending/completed/` au lieu de l'effacer. Le listener respecte cet état et `.craig-failed/` : un nouvel événement ne peut ni relancer un succès ni annuler une quarantaine. Ces dossiers sont du state runtime, à garder hors du wiki versionné (`.craig-*/`). Une reprise après quarantaine nécessite une intervention opérateur explicite.
+
+La limite porte sur le temps de traitement, pas sur la durée de la réunion. Les appels Discord/Git déjà acceptés ne peuvent pas être annulés par un timeout ; les checkpoints et les mécanismes de déduplication restent nécessaires lors d'une reprise.
 
 ## Pourquoi ce skill existe
 
@@ -113,7 +124,7 @@ Décision : passer à un orchestrateur Python déterministe. Les appels LLM (ing
     │       - validate vs meeting-debrief/schema.json
     │       - retry 3× sur erreur
     ├─ 6. subprocess debrief.py → POST recap + thread dans #hermes-perso
-    └─ 7. delete pending JSON
+    └─ 7. archive pending JSON dans .craig-pending/completed/
 
 Quand .craig-pending/ vide :
     - POST ✅ dans #hermes-perso
