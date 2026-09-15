@@ -1,7 +1,7 @@
 ---
 name: craig-listener
-description: "Active-toi sur tout message du bot Craig dans #craig-events de cette instance. Extrait le Recording ID, écrit un pending state si le recording est en cours (craig-watch prend le relais en cron), ou déclenche directement la transcription si le recording est déjà terminé. Pas de filtrage par channel : Discord garantit l'isolation entre instances."
-version: 1.0.0
+description: "Active-toi sur tout message du bot Craig dans #craig-events de cette instance, même présenté comme vide ou sans Recording ID. Lance listener.py sans argument pour récupérer et valider le panneau via API Discord. Le script extrait le Recording ID, écrit un pending state si le recording est en cours (craig-watch prend le relais en cron), ou déclenche directement la transcription si le recording est déjà terminé. Pas de filtrage par channel : Discord garantit l'isolation entre instances."
+version: 1.0.1
 platforms: [linux]
 metadata:
   hermes:
@@ -76,17 +76,17 @@ Hermes upstream **ne supporte pas `on_message_edit`** — donc le listener ne vo
 
 ## When to Use
 
-Active-toi **immédiatement** dès que tu reçois un message du bot Craig dans `#craig-events` qui contient `Recording ID:`. Cas typique : message initial avec `🔴 Recording...`.
+Active-toi **immédiatement** sur un message du bot Craig dans `#craig-events`, y compris dans le thread créé par Hermes pour ce message. Lance `listener.py` sans argument même si le contexte affiche `(The user sent a message with no text content)` ou ne contient pas `Recording ID:`.
 
-**Ne pas activer** si :
-- Le message ne contient pas `Recording ID:` (autre msg Craig, msg humain).
-- Tu es déjà en train de traiter un autre Recording ID dans ce run (séquentiel).
+Le panneau Craig utilise Discord Components V2 : son texte peut être absent du contexte transmis par Hermes alors qu'il est présent sur Discord. **Un contexte vide ne permet pas de conclure que le panneau est vide ou sans identifiant.** Le script récupère le panneau via API et valide lui-même son contenu ; ne filtre pas sur le texte visible avant de l'appeler.
+
+**Ne pas activer** sur un message humain ou d'un autre bot, ni pour un deuxième Recording ID si tu en traites déjà un dans ce run (séquentiel).
 
 ## Procedure
 
 ### 1. Acknowledge
 
-Réagis ⏳ au message Craig pour signaler que tu as bien capté.
+Réagis ⏳ au message Craig si sa référence est disponible. Si Hermes ne fournit pas de référence exploitable, passe directement au script sans inventer d’identifiant ; la réaction ne doit pas bloquer le traitement.
 
 ### 2. Lance `listener.py`
 
@@ -125,16 +125,15 @@ Le script :
 {"status": "processed",      "craig_id": "...", "path": "raw/transcripts/...", "drive_id": "...", "name": "..."}
 {"status": "skipped",        "craig_id": "...", "reason": "already-transcribed", "as": "..."}
 {"status": "error",          "craig_id": "...", "reason": "...", "detail": "..."}
-{"status": "error",          "reason": "no-recording-id|format-mismatch|empty-message|missing-discord-ids|bad-discord-ids", "detail": "..."}
+{"status": "error",          "reason": "discord-discovery-failed|format-mismatch|empty-craig-panel", "detail": "..."}
 ```
 
 - **`pending`** → silence côté Discord (la réaction ⏳ posée au step 1 reste). Vérifie `followup_cron`. Si `paused` ou `failed: <reason>` → ⚠️ noisy : surface le statut opérateur ; ne reprends pas le job et ne contourne pas le pipeline.
 - **`already-pending`** → l'event Discord a été reçu deux fois (rare, mais possible : reconnect bot, replay). Ne pose PAS une nouvelle réaction ⏳, ne renotifie pas. Le pending d'origine est toujours en vol. (Dans ce cas, `followup_cron` sera typiquement `already-running`.)
 - **`processed`** → la sortie contient un champ `progress[]` avec les phases qu'a franchies `scan.py`. Suis la **UX live** ci-dessous (path direct : pas de pending, donc l'utilisateur découvre la chaîne en un seul passage). Puis suis la procédure `craig-transcript-record` à partir du step 3 (commit + push) puis step 4 (ingest llm-wiki). Notification ✅.
 - **`skipped` / `already-transcribed`** → réagis ✅ pour confirmer qu'on est au courant.
-- **`error` / `no-recording-id`** → ce n'était pas un message Craig de recording. Retire la réaction ⏳, ignore silencieusement.
-- **`error` / `format-mismatch`** → ⚠️ **bruyant** : le message ressemble à un panel Craig (présence de `🔴 Recording`, `Voice Region:`, etc.) mais la regex `Recording ID:` a échoué. Très probablement le format Craig a changé. Notifie l'utilisateur avec le snippet, pour qu'on puisse mettre à jour la regex. Ne plus jamais ignorer silencieusement ce cas — sinon on arrête de transcrire sans s'en rendre compte.
-- **`error` / `missing-discord-ids` / `bad-discord-ids`** → escape-hatch CLI mal utilisé. En mode normal n'utilise pas ces args, le script self-discovere.
+- **`error` / `empty-craig-panel`** → ⚠️ signale le `detail` retourné par le script : le panneau récupéré via API ne contient aucun texte extractible. Ce résultat est distinct du contexte vide reçu par le LLM, qui impose d'appeler le script.
+- **`error` / `format-mismatch`** → ⚠️ signale le `detail` retourné par le script : le dernier message Craig récupéré via API ne contient pas d'identifiant reconnu. N'invente pas de Recording ID et ne classe pas ce cas silencieusement comme ignoré.
 - **`error` / `discord-discovery-failed`** → l'API Discord n'a pas pu retrouver le msg Craig. Cause classique : permission `Read Message History` manquante sur `#craig-events` (status 403 dans `detail`). Notifie ⚠️ avec le `detail` brut. **NE PAS** essayer de contourner en écrivant un pending toi-même, **NE PAS** inventer un craig_id, **NE PAS** bypasser le script — le seul vrai fix est côté Discord (config perm).
 - **`error` / autres** → notifie ⚠️ avec `reason` + `detail`. Idem : aucune réécriture manuelle de pending JSON, aucune invention d'ID. Si le script erreur, l'état n'est PAS écrit, point.
 
