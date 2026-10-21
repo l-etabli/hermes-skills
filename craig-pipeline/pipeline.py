@@ -1459,9 +1459,9 @@ def _find_followup_cron_id() -> str | None:
 
 
 def maybe_self_delete_cron() -> dict:
-    """Post the ✅ summary to #hermes-perso and remove the followup cron
+    """Notify #hermes-perso and remove the followup cron
     when there is nothing left to process. Order matters: cron removal
-    runs FIRST, the ✅ is posted only after the cron is gone, so a
+    runs FIRST, the notification is posted only after the cron is gone, so a
     parser failure or remove error doesn't spam the channel each tick
     (observed prod behaviour 2026-04-26 — the ✅ posted unconditionally
     and an unrelated parse bug kept the cron alive for ~12 ticks)."""
@@ -1482,7 +1482,12 @@ def maybe_self_delete_cron() -> dict:
         return {"status": "remove-failed",
                 "detail": (rm.stderr or rm.stdout)[:200], "job_id": job_id}
 
-    msg = "✅ Suivi craig-watch terminé, tous les recordings ont été traités."
+    # Quarantined recordings also leave the pending queue: emptiness does
+    # not prove successful transcription or publication of every debrief.
+    msg = (
+        "ℹ️ Suivi Craig arrêté : la file d’attente est vide. "
+        "Les résultats et éventuelles erreurs sont indiqués ci-dessus."
+    )
     msg_id, err = discord_post(DISCORD_HOME_CHANNEL, msg)
     notif = {"posted_message_id": msg_id, "post_error": err}
     return {**notif, "status": "removed", "job_id": job_id}
