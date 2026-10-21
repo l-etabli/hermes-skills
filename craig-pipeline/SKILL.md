@@ -25,7 +25,7 @@ required_environment_variables:
   - name: CRAIG_GROQ_API_KEY
     prompt: "Hérité par scan.py (transcription Groq Whisper)."
     required_for: full functionality
-  - name: GOOGLE_APPLICATION_CREDENTIALS
+  - name: CRAIG_DRIVE_CREDENTIALS
     prompt: "Hérité par scan.py (Drive service account)."
     required_for: full functionality
   - name: AUDIO_DRIVE_FOLDER_ID

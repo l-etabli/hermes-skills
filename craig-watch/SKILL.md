@@ -16,7 +16,7 @@ required_environment_variables:
   - name: CRAIG_DISCORD_BOT_TOKEN
     prompt: "Token du bot Discord dédié aux skills Craig. Utilisé pour refetch les messages Craig via l'API REST (GET /channels/.../messages/...)."
     required_for: full functionality
-  - name: GOOGLE_APPLICATION_CREDENTIALS
+  - name: CRAIG_DRIVE_CREDENTIALS
     prompt: "Chemin du JSON Service Account Drive. Hérité par craig-transcript-record."
     required_for: full functionality
   - name: AUDIO_DRIVE_FOLDER_ID

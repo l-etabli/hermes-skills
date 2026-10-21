@@ -19,7 +19,7 @@ required_environment_variables:
   - name: CRAIG_EVENTS_CHANNEL_ID
     prompt: "ID Discord du #craig-events de cette instance. Clic droit sur le salon > Copier l'ID (Developer Mode ON)."
     required_for: full functionality
-  - name: GOOGLE_APPLICATION_CREDENTIALS
+  - name: CRAIG_DRIVE_CREDENTIALS
     prompt: "Chemin du JSON Service Account Drive. Hérité par craig-transcript-record."
     required_for: full functionality
   - name: AUDIO_DRIVE_FOLDER_ID

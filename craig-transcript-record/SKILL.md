@@ -13,7 +13,7 @@ required_environment_variables:
   - name: WIKI_PATH
     prompt: "Chemin absolu vers le vault llm-wiki (ex. /opt/data/wiki). Le skill llm-wiki utilise la même variable."
     required_for: full functionality
-  - name: GOOGLE_APPLICATION_CREDENTIALS
+  - name: CRAIG_DRIVE_CREDENTIALS
     prompt: "Chemin absolu vers le JSON du Service Account Google (ex. /opt/data/google-drive-sa.json). Le SA doit avoir le dossier Drive partagé avec lui (rôle Viewer minimum)."
     required_for: full functionality
   - name: AUDIO_DRIVE_FOLDER_ID
@@ -72,7 +72,7 @@ Avant de lancer, observe ces règles propres à l'environnement Hermes :
 
 ```bash
 command -v uv && command -v ffmpeg && \
-  for v in WIKI_PATH GOOGLE_APPLICATION_CREDENTIALS AUDIO_DRIVE_FOLDER_ID CRAIG_GROQ_API_KEY; do \
+  for v in WIKI_PATH CRAIG_DRIVE_CREDENTIALS AUDIO_DRIVE_FOLDER_ID CRAIG_GROQ_API_KEY; do \
     [ -n "${!v}" ] || { echo "missing $v"; exit 1; }; \
   done && echo "ok"
 ```
@@ -171,7 +171,11 @@ Après exécution, vérifie pour le recording traité :
 
 ## Notes
 
-- **Auth Drive** : Service Account via `GOOGLE_APPLICATION_CREDENTIALS`, scoppé aux dossiers explicitement partagés avec l'email du SA.
+- **Auth Drive** : Service Account via `CRAIG_DRIVE_CREDENTIALS`, scoppé aux dossiers explicitement partagés avec l'email du SA.
 - **Coût** : Craig $8/mois Patreon Tier 3 (recording + auto-upload Drive) ; Groq ~$0.04/h audio (free tier généreux pour usage perso).
 - **Latence end-to-end** : upload Drive (1-15 min post-recording) + Groq (~0.1× realtime) ≈ 2-20 min pour 1h d'audio. Le script bloque pendant le poll Drive — c'est normal.
 - **Pourquoi pas d'auto-ingest sans seuil** : `llm-wiki` impose des seuils stricts (≥ 2 mentions ou central à 1 source). Cette décision relève de l'agent au moment de l'ingest, pas de ce skill.
+
+Le nom dédié `CRAIG_DRIVE_CREDENTIALS` évite la suppression de la variable
+provider `GOOGLE_APPLICATION_CREDENTIALS` par le sandbox Hermes. Le script
+accepte encore ce nom historique en fallback pour les exécutions hors sandbox.
