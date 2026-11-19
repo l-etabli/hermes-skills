@@ -34,6 +34,7 @@ hermes-skills/
 │   ├── SKILL.md
 │   └── quick_ingest.py
 ├── weekly-digest/            # cron : récap vendredi + briefing lundi dans home channel
+├── agenda/                   # agendas Google : RDV dictés, brief, rappels, conflits
 │   ├── SKILL.md
 │   └── digest.py
 └── …
@@ -135,6 +136,7 @@ Famille **Wiki texte** — capture conversationnelle Discord -> KB :
 |---|---|---|---|
 | [`wiki-quick`](./wiki-quick/) | research | Mention user (« wiki ça », « ingest cette conv ») | Drop conversationnel : pose le contenu dans `raw/notes/<slug>.md` du KB avec frontmatter (`source: discord`, `captured_by: wiki-quick`, `channel`, `participants`), pull/commit/push. Aucun appel LLM. L'agent enchaîne avec `llm-wiki ingest <path>` pour la promotion en pages `entities/`/`concepts/` selon les seuils du SCHEMA. |
 | [`weekly-digest`](./weekly-digest/) | kb | Cron 2× / semaine | `--recap` vendredi 17h (3 bullets décidé/livré/noté), `--briefing` lundi 9h (objectifs/actions reprises/blocages/échéances). Lit l'historique 7j des channels visibles au bot dédié, génère via `hermes -z` avec le provider GPT/OAuth, POST dans `$CRAIG_HOME_CHANNEL`, append au `log.md` du KB. |
+| [`agenda`](./agenda/) | productivity | RDV dicté ou question de planning ; 3 crons (perso) | Lit les agendas Google partagés avec le compte de service de l'instance (ni mails ni Drive), crée dans le bon agenda Google les RDV dictés, ne modifie ou supprime que ceux qu'il a créés. Crons : brief 7h30, rappels 30 min avant (monitor), conflits à 7 jours (monitor). Config : `$AGENDA_CALENDARS`. |
 
 ### Exemples rapides
 
